@@ -1,0 +1,3107 @@
+"""
+文件自动归类程序
+================
+功能：
+  1. 实时递归监视指定文件夹，文件写入完成后将其剪切到输出文件夹
+  2. 按程序同目录下的发票号清单 Excel 第一列发票号匹配文件名前缀，自动归入对应发票号子文件夹
+  3. 识别退税材料齐套状态，生成判断报告，并按报关号改名发票号文件夹
+  4. 输出主文件夹生成以日期命名的 JSON / Excel 工作日志
+  5. 图形界面，适合普通用户操作
+  6. 支持同时处理1000+文件（线程池并发处理）
+
+依赖安装：
+  pip install watchdog openpyxl PyMuPDF rapidocr-onnxruntime
+"""
+
+import os
+import re
+import sys
+import time
+import shutil
+import logging
+import threading
+import queue
+import json
+import tempfile
+from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+except ImportError:
+    Observer = None
+    FileSystemEventHandler = object
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+except ImportError:
+    openpyxl = None
+
+
+# ─────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────
+
+SCRIPT_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+DEFAULT_INVOICE_WORKBOOK = SCRIPT_DIR / "04月发票号清单.xlsx"
+APP_SETTINGS_PATH = SCRIPT_DIR / "app_settings.json"
+DATA_DIR = SCRIPT_DIR / "data"
+DEFAULT_COMPANY_LEDGER = DATA_DIR / "公司系统出运统计发票号清单.xlsx"
+DEFAULT_MATERIAL_CONFIG = SCRIPT_DIR / "materials_config.json"
+REVIEW_SUBFOLDER = "未匹配发票号"
+IGNORED_SUFFIXES = {
+    ".tmp", ".temp", ".crdownload", ".part", ".download", ".swp", ".lock",
+}
+IGNORED_PREFIXES = ("~$", ".~lock")
+REPORT_PREFIXES = ("工作日志_", "判断报告_", "rename_manifest_")
+DEFAULT_DECLARATION_TIMEOUT_SECONDS = 60.0
+EXCEL_WRITE_LOCK = threading.Lock()
+
+
+def default_app_settings() -> dict:
+    return {
+        "company_ledger": {
+            "path": "data/公司系统出运统计发票号清单.xlsx"
+        },
+        "finance_batch": {
+            "output_subdir": "财务退税批次包",
+            "copy_mode": "copy",
+            "write_back_company_ledger": True,
+            "write_back_finance_batch": True,
+            "create_marked_batch_copy": True
+        }
+    }
+
+
+def _merge_missing_settings(base: dict, defaults: dict) -> bool:
+    changed = False
+    for key, value in defaults.items():
+        if key not in base:
+            base[key] = value
+            changed = True
+            continue
+        if isinstance(base.get(key), dict) and isinstance(value, dict):
+            changed = _merge_missing_settings(base[key], value) or changed
+    return changed
+
+
+def ensure_app_settings(path: Path = APP_SETTINGS_PATH) -> dict:
+    defaults = default_app_settings()
+    path = Path(path)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(defaults, f, ensure_ascii=False, indent=2)
+        return defaults
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"app_settings.json 格式错误，请修正后重试：{path}") from exc
+
+    if not isinstance(settings, dict):
+        settings = {}
+    if _merge_missing_settings(settings, defaults):
+        save_app_settings(settings, path)
+    return settings
+
+
+def save_app_settings(settings: dict, path: Path = APP_SETTINGS_PATH):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def resolve_app_path(relative_or_abs: str) -> Path:
+    raw = str(relative_or_abs or "").strip()
+    if not raw:
+        return DEFAULT_COMPANY_LEDGER
+    path = Path(raw).expanduser()
+    if path.is_absolute() or re.match(r"^[A-Za-z]:[\\/]", raw):
+        return path
+    return SCRIPT_DIR / path
+
+
+def normalize_path(path: str) -> str:
+    return os.path.abspath(os.path.normpath(path))
+
+
+def comparable_path(path: str) -> str:
+    return os.path.normcase(normalize_path(path))
+
+
+def paths_equal(left: str, right: str) -> bool:
+    return comparable_path(left) == comparable_path(right)
+
+
+def is_path_inside(child: str, parent: str) -> bool:
+    child_cmp = comparable_path(child)
+    parent_cmp = comparable_path(parent)
+    try:
+        return os.path.commonpath([child_cmp, parent_cmp]) == parent_cmp
+    except ValueError:
+        return False
+
+
+def should_ignore_file(filepath: str) -> bool:
+    filename = os.path.basename(filepath)
+    suffix = Path(filename).suffix.lower()
+    return (
+        not filename
+        or filename.startswith(IGNORED_PREFIXES)
+        or filename.startswith(REPORT_PREFIXES)
+        or suffix in IGNORED_SUFFIXES
+    )
+
+
+def sanitize_folder_name(name: str) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|]', "_", str(name).strip()).strip(". ")
+    return cleaned or "未分类"
+
+
+def unique_path(path: str) -> str:
+    if not os.path.exists(path):
+        return path
+
+    folder = os.path.dirname(path)
+    stem = Path(path).stem
+    suffix = Path(path).suffix
+    counter = 1
+    while True:
+        candidate = os.path.join(folder, f"{stem}_重复{counter}{suffix}")
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+
+
+def merge_folder_contents(source_dir: str, target_dir: str) -> None:
+    source_dir = normalize_path(source_dir)
+    target_dir = normalize_path(target_dir)
+    if paths_equal(source_dir, target_dir) or not os.path.isdir(source_dir) or not os.path.isdir(target_dir):
+        return
+
+    for name in os.listdir(source_dir):
+        src = os.path.join(source_dir, name)
+        dst = os.path.join(target_dir, name)
+        if os.path.exists(dst):
+            dst = unique_path(dst)
+        shutil.move(src, dst)
+    os.rmdir(source_dir)
+
+
+def normalize_text_for_match(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def strip_invoice_prefix(filename: str, invoice_no: str) -> str:
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    if invoice_no and stem.casefold().startswith(invoice_no.casefold()):
+        stem = stem[len(invoice_no):]
+        stem = re.sub(r"^[\s_\-—–+]+", "", stem)
+    return f"{stem}{suffix}" if stem else filename
+
+
+def invoice_display_value(invoice_no: str, mode: str = "digits_only") -> str:
+    if mode == "digits_only":
+        digits = "".join(re.findall(r"\d+", invoice_no))
+        return digits or invoice_no
+    return invoice_no
+
+
+def format_excel_cell(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def normalize_identifier(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", str(value or "")).upper()
+
+
+def invoice_digits(value: str) -> str:
+    return "".join(re.findall(r"\d+", str(value or "")))
+
+
+def invoice_equivalent(left: str, right: str) -> bool:
+    left_norm = normalize_identifier(left)
+    right_norm = normalize_identifier(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    left_digits = invoice_digits(left_norm)
+    right_digits = invoice_digits(right_norm)
+    return bool(left_digits and len(left_digits) >= 6 and left_digits == right_digits)
+
+
+def invoice_dedup_key(invoice_no: str) -> str:
+    digits = invoice_digits(invoice_no)
+    if len(digits) >= 6:
+        return f"digits:{digits}"
+    normalized = normalize_identifier(invoice_no)
+    return f"id:{normalized}" if normalized else str(invoice_no or "").strip().casefold()
+
+
+def normalize_amount(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return round(float(value), 2)
+    text = str(value)
+    text = re.sub(r"[^\d.\-]", "", text.replace(",", ""))
+    if not text:
+        return None
+    try:
+        return round(float(text), 2)
+    except ValueError:
+        return None
+
+
+def amounts_equal(left, right, tolerance: float = 0.05) -> bool:
+    left_amount = normalize_amount(left)
+    right_amount = normalize_amount(right)
+    if left_amount is None or right_amount is None:
+        return False
+    return abs(left_amount - right_amount) <= tolerance
+
+
+MONTH_MAP = {
+    "JAN": 1, "JANUARY": 1,
+    "FEB": 2, "FEBRUARY": 2,
+    "MAR": 3, "MARCH": 3,
+    "APR": 4, "APRIL": 4,
+    "MAY": 5,
+    "JUN": 6, "JUNE": 6,
+    "JUL": 7, "JULY": 7,
+    "AUG": 8, "AUGUST": 8,
+    "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10,
+    "NOV": 11, "NOVEMBER": 11,
+    "DEC": 12, "DECEMBER": 12,
+}
+
+
+COUNTRY_MAP = {
+    "POLAND": "波兰",
+    "GDANSK": "波兰",
+    "GERMANY": "德国",
+    "ITALY": "意大利",
+    "ECUADOR": "厄瓜多尔",
+    "BELGIUM": "比利时",
+    "LUXEMBOURG": "卢森堡",
+    "UNITED STATES": "美国",
+    "USA": "美国",
+    "U.S.A": "美国",
+}
+
+
+def normalize_country(value: str) -> str:
+    text = normalize_text_for_match(value)
+    if not text:
+        return ""
+    for key, country in COUNTRY_MAP.items():
+        if key.casefold() in text:
+            return country
+    return str(value).strip()
+
+
+def normalize_date_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (int, float)):
+        try:
+            return (datetime(1899, 12, 30) + timedelta(days=float(value))).date().isoformat()
+        except Exception:
+            return ""
+
+    text = str(value).strip()
+    if not text:
+        return ""
+
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日", "%b.%d,%Y", "%b %d %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            pass
+
+    match = re.search(
+        r"\b(JANUARY|JAN|FEBRUARY|FEB|MARCH|MAR|APRIL|APR|MAY|JUNE|JUN|JULY|JUL|AUGUST|AUG|SEPTEMBER|SEPT|SEP|OCTOBER|OCT|NOVEMBER|NOV|DECEMBER|DEC)\.?\s*,?\s*(\d{1,2})\s*,?\s*(\d{4})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        month = MONTH_MAP[match.group(1).upper()]
+        day = int(match.group(2))
+        year = int(match.group(3))
+        return date(year, month, day).isoformat()
+    return ""
+
+
+def dates_close(left: str, right: str, max_days: int = 3) -> bool:
+    try:
+        left_date = datetime.fromisoformat(left).date()
+        right_date = datetime.fromisoformat(right).date()
+    except Exception:
+        return False
+    return abs((left_date - right_date).days) <= max_days
+
+
+def find_invoice_workbook(settings: dict | None = None):
+    settings = settings or ensure_app_settings(APP_SETTINGS_PATH)
+    ledger_path = resolve_app_path(
+        settings.get("company_ledger", {}).get(
+            "path",
+            "data/公司系统出运统计发票号清单.xlsx",
+        )
+    )
+    if ledger_path.exists():
+        return ledger_path
+    if DEFAULT_INVOICE_WORKBOOK.exists():
+        return DEFAULT_INVOICE_WORKBOOK
+    return None
+
+
+def load_invoice_numbers(workbook_path: str) -> list[str]:
+    if openpyxl is None:
+        raise RuntimeError("缺少 openpyxl，无法读取发票号清单")
+
+    invoices = []
+    seen = set()
+    wb = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        for row in ws.iter_rows(min_col=1, max_col=1, values_only=True):
+            invoice_no = format_excel_cell(row[0])
+            if not invoice_no or invoice_no in {"发票号", "invoice", "Invoice"}:
+                continue
+            key = invoice_no.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            invoices.append(invoice_no)
+    finally:
+        wb.close()
+
+    invoices.sort(key=len, reverse=True)
+    return invoices
+
+
+def load_invoice_records(workbook_path: str) -> dict[str, dict]:
+    """读取发票号台账，并保留闭环校验需要的辅助字段。"""
+    if openpyxl is None:
+        raise RuntimeError("缺少 openpyxl，无法读取发票号清单")
+
+    records: dict[str, dict] = {}
+    wb = openpyxl.load_workbook(workbook_path, read_only=True, data_only=True)
+    try:
+        for ws in wb.worksheets:
+            rows = ws.iter_rows(values_only=True)
+            try:
+                headers = [format_excel_cell(value) for value in next(rows)]
+            except StopIteration:
+                continue
+
+            header_index = {header: idx for idx, header in enumerate(headers) if header}
+            invoice_idx = header_index.get("发票号")
+            if invoice_idx is None:
+                continue
+
+            date_idx = header_index.get("出运日期")
+            country_idx = (
+                header_index.get("目的国(地区)")
+                if "目的国(地区)" in header_index
+                else header_index.get("目的国")
+            )
+            amount_idx = header_index.get("金额")
+
+            for row_no, row in enumerate(rows, start=2):
+                invoice_no = format_excel_cell(row[invoice_idx] if invoice_idx < len(row) else "")
+                if not invoice_no:
+                    continue
+                records[invoice_no] = {
+                    "发票号": invoice_no,
+                    "sheet": ws.title,
+                    "row": row_no,
+                    "出运日期": normalize_date_value(row[date_idx] if date_idx is not None and date_idx < len(row) else None),
+                    "目的国": normalize_country(row[country_idx] if country_idx is not None and country_idx < len(row) else ""),
+                    "金额": normalize_amount(row[amount_idx] if amount_idx is not None and amount_idx < len(row) else None),
+                }
+    finally:
+        wb.close()
+
+    return records
+
+
+class InvoiceMatcher:
+    def __init__(self, invoice_numbers: list[str]):
+        self._entries = [
+            (str(invoice_no).strip().casefold(), str(invoice_no).strip().upper())
+            for invoice_no in sorted(invoice_numbers, key=len, reverse=True)
+            if str(invoice_no).strip()
+        ]
+
+    def match(self, filename: str) -> str:
+        raw_name = Path(filename).name.strip()
+        name = raw_name.casefold()
+        for key, invoice_no in self._entries:
+            if name.startswith(key):
+                return invoice_no
+        if ("采购合同" in raw_name or "合同" in raw_name):
+            match = re.match(r"^\s*(LY\d{8,12})(?!\d)", raw_name, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
+        return ""
+
+
+def can_acquire_file_lock(filepath: str) -> bool:
+    """尝试取得独占文件锁，失败说明文件可能仍在写入或被其他程序占用。"""
+    try:
+        with open(filepath, "r+b") as fh:
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    return True
+                except OSError:
+                    return False
+            else:
+                import fcntl
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                    return True
+                except OSError:
+                    return False
+    except OSError:
+        return False
+
+
+def wait_for_file_ready(
+    filepath: str,
+    timeout_seconds: float = 30.0,
+    poll_interval: float = 1.0,
+    stable_checks: int = 2,
+) -> tuple[bool, str]:
+    """等待文件大小连续稳定，并且能取得独占锁。"""
+    deadline = time.monotonic() + timeout_seconds
+    last_size = None
+    stable_count = 0
+    last_reason = "文件尚未稳定"
+
+    while time.monotonic() <= deadline:
+        if not os.path.exists(filepath):
+            return False, "文件不存在"
+        if should_ignore_file(filepath):
+            return False, "临时文件或锁文件已忽略"
+
+        try:
+            current_size = os.path.getsize(filepath)
+        except OSError as exc:
+            last_reason = str(exc)
+            current_size = None
+
+        if current_size and current_size > 0:
+            if current_size == last_size:
+                stable_count += 1
+            else:
+                stable_count = 0
+                last_size = current_size
+
+            if stable_count >= stable_checks:
+                if can_acquire_file_lock(filepath):
+                    return True, ""
+                last_reason = "文件大小已稳定，但仍无法取得独占锁"
+        else:
+            stable_count = 0
+            last_reason = "文件为空或暂时无法读取大小"
+
+        sleep_for = min(poll_interval, max(0, deadline - time.monotonic()))
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+
+    return False, f"超过 {timeout_seconds:.0f} 秒仍未完成写入：{last_reason}"
+
+
+def is_file_ready(filepath: str, stable_seconds: float = 1.0) -> bool:
+    ready, _ = wait_for_file_ready(
+        filepath,
+        timeout_seconds=max(3.0, stable_seconds * 3),
+        poll_interval=stable_seconds,
+        stable_checks=1,
+    )
+    return ready
+
+
+def move_file_to_output(
+    src_path: str,
+    output_dir: str,
+    invoice_matcher: InvoiceMatcher,
+    invoice_dir_resolver=None,
+) -> tuple:
+    """
+    将文件剪切到输出目录的发票号子文件夹。
+    返回 (success, subfolder, message, dest_path, invoice_no, status)
+    """
+    filename = os.path.basename(src_path)
+    invoice_no = invoice_matcher.match(filename)
+    matched = bool(invoice_no)
+    subfolder_name = sanitize_folder_name(invoice_no if matched else REVIEW_SUBFOLDER)
+    dest_dir = (
+        invoice_dir_resolver(invoice_no)
+        if matched and invoice_dir_resolver
+        else os.path.join(output_dir, subfolder_name)
+    )
+    actual_subfolder_name = os.path.basename(os.path.normpath(dest_dir)) if matched else subfolder_name
+
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        dest_path = os.path.join(dest_dir, filename)
+
+        # 如果目标已存在，在文件名后加时间戳避免覆盖
+        if os.path.exists(dest_path):
+            stem = Path(filename).stem
+            suffix = Path(filename).suffix
+            timestamp = int(time.time() * 1000)
+            dest_path = os.path.join(dest_dir, f"{stem}_{timestamp}{suffix}")
+
+        shutil.move(src_path, dest_path)
+        if matched:
+            return True, actual_subfolder_name, f"成功: {filename} → {actual_subfolder_name}/", dest_path, invoice_no, "成功"
+        return (
+            True,
+            subfolder_name,
+            f"未匹配发票号，已移入人工复核: {filename} → {subfolder_name}/",
+            dest_path,
+            invoice_no,
+            "未匹配",
+        )
+    except Exception as e:
+        return False, "", f"失败: {filename} | 原因: {e}", "", invoice_no, "失败"
+
+
+# ─────────────────────────────────────────────
+# 退税材料识别、判断报告、改名处理
+# ─────────────────────────────────────────────
+
+def default_material_config() -> dict:
+    return {
+        "folder_name": {
+            "separator": "   ",
+            "invoice_display": "digits_only",
+        },
+        "classification": {
+            "auto_accept_score": 70,
+            "manual_review_score": 40,
+        },
+        "materials": [
+            {
+                "id": "export_sales",
+                "name": "外销",
+                "required": True,
+                "final_name": "外销",
+                "file_name_patterns": ["外销", "proforma"],
+                "pdf_text_rules": {
+                    "all": ["PROFORMA INVOICE"],
+                    "any": [
+                        "JIAXING LAYO",
+                        "Transport details",
+                        "Terms of payment",
+                        "Description of goods",
+                    ],
+                },
+                "ocr_text_rules": {
+                    "all": ["PROFORMA INVOICE"],
+                },
+                "negative_patterns": ["电子发票", "发票号码"],
+            },
+            {
+                "id": "customs_power_of_attorney",
+                "name": "报关委托书",
+                "required": True,
+                "final_name": "报关委托书",
+                "file_name_patterns": ["报关委托书", "委托书"],
+                "pdf_text_rules": {
+                    "any": ["报关委托书", "代理报关委托", "报关单编号", "一般贸易"],
+                    "regex_any": [r"\b\d{15,24}\b", r"\b\d{10}\b"],
+                },
+                "ocr_text_rules": {
+                    "any": ["报关委托书", "代理报关委托", "报关单编号", "一般贸易"],
+                },
+            },
+            {
+                "id": "customs_fee_invoice",
+                "name": "报关费发票",
+                "required": True,
+                "final_name": "报关费发票",
+                "file_name_patterns": ["报关费发票", "报关费", "报关发票"],
+                "pdf_text_rules": {
+                    "all": ["电子发票", "发票号码"],
+                    "any": ["国内货物运输代理服务", "报关", "嘉兴新锴国际货运代理"],
+                },
+                "negative_patterns": ["国际货运代理费", "港口码头费"],
+            },
+            {
+                "id": "bill_of_lading",
+                "name": "提单",
+                "required": True,
+                "final_name": "提单",
+                "file_name_patterns": ["提单", "bill of lading", "b/l"],
+                "pdf_text_rules": {
+                    "any": [
+                        "SHIPPER",
+                        "CONSIGNEE",
+                        "NOTIFY PARTY",
+                        "FREIGHT COLLECT",
+                        "SHIPPED ON BOARD",
+                        "SHIPPER'S LOAD COUNT",
+                    ],
+                    "regex_any": [r"[A-Z]{4}\d{7}", r"\d+\s*CARTONS", r"\d+\.\d+KGS"],
+                },
+            },
+            {
+                "id": "packing_list",
+                "name": "装箱单",
+                "required": True,
+                "final_name": "装箱单",
+                "file_name_patterns": ["装箱单", "箱单", "packing list"],
+                "ocr_text_rules": {
+                    "any": ["PACKING LIST", "装箱单", "CARTONS", "G.W.", "N.W.", "MEAS"],
+                },
+            },
+            {
+                "id": "freight_invoice",
+                "name": "运费发票",
+                "required": True,
+                "final_name": "运费发票",
+                "file_name_patterns": ["运费发票", "运费"],
+                "pdf_text_rules": {
+                    "all": ["电子发票", "发票号码"],
+                    "any": ["国际货运代理费", "港口码头费", "汇利达欧海国际货运代理"],
+                },
+                "negative_patterns": ["国内货物运输代理服务", "报关费"],
+            },
+            {
+                "id": "purchase_contract",
+                "name": "采购合同",
+                "required": False,
+                "final_name": "采购合同",
+                "file_name_only": True,
+                "file_name_patterns": ["采购合同", "合同"],
+            },
+        ],
+    }
+
+
+def ensure_material_config(path: Path = DEFAULT_MATERIAL_CONFIG) -> dict:
+    if not path.exists():
+        data = default_material_config()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return data
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    changed = False
+    for material in data.get("materials", []):
+        if material.get("id") == "purchase_contract":
+            patterns = material.setdefault("file_name_patterns", [])
+            if "合同" not in patterns:
+                patterns.append("合同")
+                changed = True
+            break
+    if changed:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    return data
+
+
+def keyword_match(pattern: str, text: str) -> bool:
+    if not pattern:
+        return False
+    if pattern.startswith("re:"):
+        return re.search(pattern[3:], text, re.IGNORECASE) is not None
+    return normalize_text_for_match(pattern) in normalize_text_for_match(text)
+
+
+def pdf_text(filepath: str, max_pages: int = 2) -> str:
+    if Path(filepath).suffix.lower() != ".pdf":
+        return ""
+    try:
+        import fitz
+    except Exception:
+        return ""
+
+    try:
+        doc = fitz.open(filepath)
+        try:
+            chunks = []
+            for page in doc[:max_pages]:
+                chunks.append(page.get_text("text"))
+            return "\n".join(chunks).strip()
+        finally:
+            doc.close()
+    except Exception as exc:
+        logging.error(f"PDF 文本提取失败: {filepath} | {exc}")
+        return ""
+
+
+def rapid_ocr_text(filepath: str) -> str:
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except Exception:
+        try:
+            from rapidocr import RapidOCR
+        except Exception:
+            return ""
+
+    try:
+        engine = rapid_ocr_text._engine
+    except AttributeError:
+        engine = RapidOCR()
+        rapid_ocr_text._engine = engine
+
+    try:
+        result, _ = engine(filepath)
+    except Exception as exc:
+        logging.error(f"OCR 识别失败: {filepath} | {exc}")
+        return ""
+    if not result:
+        return ""
+    return "\n".join(str(item[1]) for item in result if len(item) >= 2)
+
+
+def ocr_text(filepath: str, max_pdf_pages: int = 1) -> str:
+    suffix = Path(filepath).suffix.lower()
+    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
+        return rapid_ocr_text(filepath)
+    if suffix != ".pdf":
+        return ""
+
+    try:
+        import fitz
+    except Exception:
+        return ""
+
+    texts = []
+    try:
+        doc = fitz.open(filepath)
+        try:
+            for page in doc[:max_pdf_pages]:
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp_path = tmp.name
+                try:
+                    pix.save(tmp_path)
+                    text = rapid_ocr_text(tmp_path)
+                    if text:
+                        texts.append(text)
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        finally:
+            doc.close()
+    except Exception as exc:
+        logging.error(f"PDF OCR 渲染失败: {filepath} | {exc}")
+    return "\n".join(texts).strip()
+
+
+def extract_declaration_number(text: str) -> str:
+    if not text:
+        return ""
+    candidates = re.findall(r"\b\d{15,24}\b", text)
+    return candidates[0] if candidates else ""
+
+
+def extract_amounts(text: str) -> list[float]:
+    amounts = []
+    for match in re.findall(r"(?:USD|RMB|CNY|¥|\$)?\s*-?\d[\d,]*(?:\.\d{1,4})?", text or "", re.IGNORECASE):
+        amount = normalize_amount(match)
+        if amount is not None:
+            amounts.append(amount)
+    return amounts
+
+
+def extract_dates(text: str) -> list[str]:
+    values = []
+    if not text:
+        return values
+
+    patterns = [
+        r"\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b",
+        r"\d{4}年\d{1,2}月\d{1,2}日",
+        r"\b(?:JANUARY|JAN|FEBRUARY|FEB|MARCH|MAR|APRIL|APR|MAY|JUNE|JUN|JULY|JUL|AUGUST|AUG|SEPTEMBER|SEPT|SEP|OCTOBER|OCT|NOVEMBER|NOV|DECEMBER|DEC)\.?\s*,?\s*\d{1,2}\s*,?\s*\d{4}\b",
+    ]
+    for pattern in patterns:
+        for raw in re.findall(pattern, text, re.IGNORECASE):
+            normalized = normalize_date_value(raw)
+            if normalized and normalized not in values:
+                values.append(normalized)
+    return values
+
+
+def extract_document_fields(material_id: str, text: str, filename: str) -> dict:
+    haystack = f"{filename}\n{text or ''}"
+    fields = {
+        "invoice_numbers": re.findall(r"\b[A-Z]{1,4}\d{6,12}\b", haystack, re.IGNORECASE),
+        "customs_declaration_numbers": [],
+        "bl_numbers": [],
+        "booking_refs": [],
+        "container_numbers": [],
+        "seal_numbers": [],
+        "amounts": extract_amounts(haystack),
+        "dates": extract_dates(haystack),
+        "countries": [],
+        "raw_text_sample": re.sub(r"\s+", " ", haystack).strip()[:500],
+    }
+
+    upper = haystack.upper()
+    for key, country in COUNTRY_MAP.items():
+        if key in upper and country not in fields["countries"]:
+            fields["countries"].append(country)
+
+    container_numbers = set(re.findall(r"\b[A-Z]{4}\d{7}\b", upper))
+    fields["container_numbers"] = sorted(container_numbers)
+
+    # 提单号通常是 5-8 位字母 + 6-12 位数字，避免与 4 字母+7数字的箱号混淆。
+    bl_numbers = {
+        value for value in re.findall(r"\b[A-Z]{5,8}\d{6,12}\b", upper)
+        if value not in container_numbers
+    }
+    if material_id in {"bill_of_lading", "freight_invoice"}:
+        fields["bl_numbers"] = sorted(bl_numbers)
+
+    booking_refs = set(re.findall(r"\b\d{2,}[A-Z]{2,}[A-Z0-9]{5,}\b", upper))
+    if material_id in {"customs_power_of_attorney", "customs_fee_invoice", "packing_list"}:
+        fields["booking_refs"] = sorted(booking_refs)
+
+    long_numbers = re.findall(r"\b\d{15,24}\b", upper)
+    if material_id == "customs_power_of_attorney":
+        fields["customs_declaration_numbers"] = long_numbers[:3]
+
+    seal_candidates = {
+        value for value in re.findall(r"\b[A-Z]{1,4}\d{5,10}\b", upper)
+        if value not in container_numbers and value not in bl_numbers
+    }
+    if material_id in {"bill_of_lading", "packing_list"}:
+        fields["seal_numbers"] = sorted(seal_candidates)
+
+    return fields
+
+
+def any_overlap(left: list, right: list) -> bool:
+    return bool(set(left or []) & set(right or []))
+
+
+def any_identifier_overlap(left: list, right: list, min_prefix_length: int = 10, max_length_gap: int = 2) -> bool:
+    left_values = [normalize_identifier(value) for value in left or []]
+    right_values = [normalize_identifier(value) for value in right or []]
+    for left_value in left_values:
+        if not left_value:
+            continue
+        for right_value in right_values:
+            if not right_value:
+                continue
+            if left_value == right_value:
+                return True
+            shorter, longer = sorted((left_value, right_value), key=len)
+            if (
+                len(shorter) >= min_prefix_length
+                and len(longer) - len(shorter) <= max_length_gap
+                and longer.startswith(shorter)
+            ):
+                return True
+    return False
+
+
+class MaterialClassifier:
+    def __init__(self, config: dict):
+        self.config = config
+        self.materials = config.get("materials", [])
+        self.auto_score = int(config.get("classification", {}).get("auto_accept_score", 70))
+        self.manual_score = int(config.get("classification", {}).get("manual_review_score", 40))
+
+    def required_names(self) -> list[str]:
+        return [m["name"] for m in self.materials if m.get("required")]
+
+    def classify_file(self, filepath: str, invoice_no: str) -> dict:
+        filename = os.path.basename(filepath)
+        stripped_name = strip_invoice_prefix(filename, invoice_no)
+        for material in self.materials:
+            if not material.get("file_name_only"):
+                continue
+            score, reasons = self._score_file_name(material, stripped_name)
+            if score >= self.manual_score:
+                return {
+                    "filename": filename,
+                    "path": filepath,
+                    "stripped_name": stripped_name,
+                    "material": material,
+                    "material_id": material["id"],
+                    "material_name": material["name"],
+                    "required": bool(material.get("required")),
+                    "score": score,
+                    "status": "matched" if score >= self.manual_score else "unrecognized",
+                    "reasons": reasons,
+                    "text": "",
+                }
+
+        for material in self.materials:
+            if material.get("file_name_only"):
+                continue
+            if material.get("id") == "customs_power_of_attorney":
+                continue
+            score, reasons = self._score_file_name(material, stripped_name)
+            if score >= self.auto_score:
+                return {
+                    "filename": filename,
+                    "path": filepath,
+                    "stripped_name": stripped_name,
+                    "material": material,
+                    "material_id": material["id"],
+                    "material_name": material["name"],
+                    "required": bool(material.get("required")),
+                    "score": score,
+                    "status": "matched",
+                    "reasons": reasons,
+                    "text": "",
+                }
+
+        text_cache = {"pdf": None, "ocr": None}
+        best = None
+        all_scores = []
+
+        for material in self.materials:
+            score, reasons = self._score_material(material, filepath, stripped_name, text_cache)
+            if score:
+                all_scores.append({
+                    "material_id": material["id"],
+                    "material_name": material["name"],
+                    "score": score,
+                    "reasons": reasons,
+                })
+            if best is None or score > best["score"]:
+                best = {
+                    "material": material,
+                    "score": score,
+                    "reasons": reasons,
+                }
+
+        if not best or best["score"] < self.manual_score:
+            status = "unrecognized"
+            material = None
+        else:
+            tied = [
+                item for item in all_scores
+                if item["material_id"] != best["material"]["id"] and abs(item["score"] - best["score"]) <= 10
+            ]
+            status = "manual_review" if tied or best["score"] < self.auto_score else "matched"
+            material = best["material"]
+
+        text = ""
+        if text_cache["pdf"]:
+            text = text_cache["pdf"]
+        elif text_cache["ocr"]:
+            text = text_cache["ocr"]
+
+        return {
+            "filename": filename,
+            "path": filepath,
+            "stripped_name": stripped_name,
+            "material": material,
+            "material_id": material["id"] if material else "",
+            "material_name": material["name"] if material else "",
+            "required": bool(material and material.get("required")),
+            "score": best["score"] if best else 0,
+            "status": status,
+            "reasons": best["reasons"] if best else [],
+            "text": text,
+        }
+
+    def _score_material(self, material: dict, filepath: str, stripped_name: str, text_cache: dict) -> tuple[int, list[str]]:
+        score, reasons = self._score_file_name(material, stripped_name)
+
+        if material.get("file_name_only"):
+            return score, reasons
+
+        pdf_rules = material.get("pdf_text_rules") or {}
+        ocr_rules = material.get("ocr_text_rules") or {}
+
+        if pdf_rules:
+            if text_cache["pdf"] is None:
+                text_cache["pdf"] = pdf_text(filepath)
+            pdf_score, pdf_reasons = self._score_text_rules(pdf_rules, text_cache["pdf"], "PDF")
+            score += pdf_score
+            reasons.extend(pdf_reasons)
+
+        if ocr_rules and Path(filepath).suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".pdf"}:
+            if text_cache["ocr"] is None:
+                text_cache["ocr"] = ocr_text(filepath)
+            ocr_score, ocr_reasons = self._score_text_rules(ocr_rules, text_cache["ocr"], "OCR")
+            score += ocr_score
+            reasons.extend(ocr_reasons)
+
+        text_for_negative = "\n".join(filter(None, [text_cache["pdf"] or "", text_cache["ocr"] or "", stripped_name]))
+        for pattern in material.get("negative_patterns", []):
+            if keyword_match(pattern, text_for_negative):
+                score -= 50
+                reasons.append(f"排除词命中:{pattern}")
+
+        return max(score, 0), reasons
+
+    @staticmethod
+    def _score_file_name(material: dict, stripped_name: str) -> tuple[int, list[str]]:
+        score = 0
+        reasons = []
+        for pattern in material.get("file_name_patterns", []):
+            if keyword_match(pattern, stripped_name):
+                score += 60
+                reasons.append(f"文件名命中:{pattern}")
+                break
+        final_name = material.get("final_name") or material.get("name")
+        if final_name and keyword_match(final_name, stripped_name):
+            score += 20
+            reasons.append(f"文件名标准名命中:{final_name}")
+        return score, reasons
+
+    @staticmethod
+    def _score_text_rules(rules: dict, text: str, source: str) -> tuple[int, list[str]]:
+        if not text:
+            return 0, []
+        score = 0
+        reasons = []
+        match_count = 0
+
+        all_patterns = rules.get("all", [])
+        if all_patterns and all(keyword_match(pattern, text) for pattern in all_patterns):
+            score += 50
+            match_count += len(all_patterns)
+            reasons.append(f"{source}全部命中:{','.join(all_patterns)}")
+
+        for pattern in rules.get("any", []):
+            if keyword_match(pattern, text):
+                score += 20
+                match_count += 1
+                reasons.append(f"{source}命中:{pattern}")
+
+        for pattern in rules.get("regex_any", []):
+            if re.search(pattern, text, re.IGNORECASE):
+                score += 20
+                match_count += 1
+                reasons.append(f"{source}正则命中:{pattern}")
+
+        if match_count >= 2:
+            score += 20
+            reasons.append(f"{source}多字段组合命中")
+
+        return score, reasons
+
+
+def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: list[dict], declaration_no: str) -> dict:
+    docs = {
+        item["material_id"]: item
+        for item in classifications
+        if item.get("status") == "matched" and item.get("material_id")
+    }
+
+    score = 0
+    evidence = []
+    conflicts = []
+
+    sales = docs.get("export_sales")
+    customs = docs.get("customs_power_of_attorney")
+    bill = docs.get("bill_of_lading")
+    packing = docs.get("packing_list")
+    freight = docs.get("freight_invoice")
+    customs_fee = docs.get("customs_fee_invoice")
+
+    ledger_invoice_ok = bool(ledger_record and invoice_equivalent(ledger_record.get("发票号", ""), invoice_no))
+    sales_invoice_ok = False
+    sales_invoice_values = []
+    if sales:
+        sales_invoice_values = sales.get("fields", {}).get("invoice_numbers", [])
+        sales_invoice_ok = any(invoice_equivalent(value, invoice_no) for value in sales_invoice_values)
+    if ledger_invoice_ok or sales_invoice_ok:
+        score += 30
+        evidence.append("外销发票号/台账发票号与当前发票号一致(+30)")
+    if sales and not sales_invoice_ok:
+        if sales_invoice_values:
+            conflicts.append("外销发票号与当前发票号不一致")
+        else:
+            conflicts.append("外销发票未提取到匹配的发票号")
+
+    if ledger_record and not ledger_invoice_ok:
+        conflicts.append("台账发票号与当前发票号不一致")
+
+    customs_decl_ok = False
+    if customs:
+        customs_numbers = customs.get("fields", {}).get("customs_declaration_numbers", [])
+        customs_decl_ok = bool(
+            declaration_no and declaration_no in customs_numbers
+        )
+        if customs_decl_ok:
+            score += 30
+            evidence.append("报关委托书报关单号与当前报关号一致(+30)")
+        elif declaration_no and customs_numbers:
+            conflicts.append("报关委托书报关单号与当前报关号不一致")
+
+    bill_freight_ok = False
+    if bill and freight:
+        bill_freight_ok = any_overlap(
+            bill.get("fields", {}).get("bl_numbers", []),
+            freight.get("fields", {}).get("bl_numbers", []),
+        )
+        if bill_freight_ok:
+            score += 25
+            evidence.append("提单号连接提单与运费发票(+25)")
+
+    booking_customs_fee_ok = False
+    if customs and customs_fee:
+        booking_customs_fee_ok = any_identifier_overlap(
+            customs.get("fields", {}).get("booking_refs", []),
+            customs_fee.get("fields", {}).get("booking_refs", []),
+        )
+        if booking_customs_fee_ok:
+            score += 25
+            evidence.append("提运参考号连接报关委托书与报关费发票(+25)")
+
+    container_ok = False
+    if bill and packing:
+        container_ok = any_overlap(
+            bill.get("fields", {}).get("container_numbers", []),
+            packing.get("fields", {}).get("container_numbers", []),
+        )
+        if container_ok:
+            score += 20
+            evidence.append("箱号连接提单与装箱单(+20)")
+
+        seal_ok = any_overlap(
+            bill.get("fields", {}).get("seal_numbers", []),
+            packing.get("fields", {}).get("seal_numbers", []),
+        )
+        if seal_ok:
+            score += 20
+            evidence.append("封号连接提单与装箱单(+20)")
+    else:
+        seal_ok = False
+
+    ledger_amount_ok = False
+    ledger_country_ok = False
+    ledger_date_ok = False
+
+    if ledger_record and sales:
+        ledger_amount = ledger_record.get("金额")
+        sales_amounts = sales.get("fields", {}).get("amounts", [])
+        if ledger_amount is not None and any(amounts_equal(ledger_amount, amount) for amount in sales_amounts):
+            ledger_amount_ok = True
+            score += 15
+            evidence.append("台账金额与外销发票金额一致(+15)")
+        elif ledger_amount is not None and sales_amounts:
+            conflicts.append("台账金额与外销发票金额未匹配")
+
+        ledger_country = ledger_record.get("目的国", "")
+        sales_countries = sales.get("fields", {}).get("countries", [])
+        if ledger_country and ledger_country in sales_countries:
+            ledger_country_ok = True
+            score += 10
+            evidence.append("台账目的国与外销发票国家一致(+10)")
+        elif ledger_country and sales_countries:
+            conflicts.append("台账目的国与外销发票国家不一致")
+
+    if ledger_record and bill:
+        ledger_date = ledger_record.get("出运日期", "")
+        bill_dates = bill.get("fields", {}).get("dates", [])
+        if ledger_date and any(dates_close(ledger_date, item) for item in bill_dates):
+            ledger_date_ok = True
+            score += 15
+            evidence.append("台账出运日期与提单日期接近(+15)")
+        elif ledger_date and bill_dates:
+            conflicts.append("台账出运日期与提单日期相差过大")
+
+    strong_combo = any([
+        sales_invoice_ok and ledger_amount_ok and ledger_country_ok,
+        customs_decl_ok and booking_customs_fee_ok,
+        bill_freight_ok and container_ok and seal_ok,
+        sales_invoice_ok and ledger_date_ok and (bill_freight_ok or booking_customs_fee_ok),
+    ])
+
+    if score >= 90 and strong_combo and not conflicts:
+        status = "strong_pass"
+        status_label = "强闭环通过"
+    elif score >= 70 and strong_combo and not conflicts:
+        status = "basic_pass"
+        status_label = "基本闭环通过"
+    elif score >= 50:
+        status = "review"
+        status_label = "待复核"
+    else:
+        status = "failed"
+        status_label = "不通过"
+
+    return {
+        "status": status,
+        "status_label": status_label,
+        "score": score,
+        "evidence": evidence,
+        "conflicts": conflicts,
+        "strong_combo": strong_combo,
+    }
+
+
+class TaxRefundProcessor:
+    def __init__(self, output_dir: str, config_path: Path = DEFAULT_MATERIAL_CONFIG, ledger_records: dict = None):
+        self.output_dir = output_dir
+        self.config_path = config_path
+        self.config = ensure_material_config(config_path)
+        self.classifier = MaterialClassifier(self.config)
+        self.ledger_records = ledger_records or {}
+        self.lock = threading.Lock()
+        self.declaration_path = os.path.join(output_dir, "declaration_overrides.json")
+        self.declarations = self._load_declarations()
+
+    def resolve_target_folder(self, invoice_no: str) -> str:
+        original = os.path.join(self.output_dir, sanitize_folder_name(invoice_no))
+
+        digits = invoice_digits(invoice_no)
+        if digits:
+            digits_folder = os.path.join(self.output_dir, sanitize_folder_name(digits))
+            if os.path.isdir(digits_folder):
+                if os.path.isdir(original):
+                    merge_folder_contents(original, digits_folder)
+                return digits_folder
+
+        if os.path.isdir(original):
+            return original
+
+        display = self.invoice_display(invoice_no)
+        separator = self.config.get("folder_name", {}).get("separator", "   ")
+        suffix = f"{separator}{display}"
+        suffix_pattern = re.compile(re.escape(suffix) + r"(_重复\d+)?$")
+        for entry in os.scandir(self.output_dir):
+            if entry.is_dir() and suffix_pattern.search(entry.name):
+                return entry.path
+        return original
+
+    def invoice_display(self, invoice_no: str) -> str:
+        mode = self.config.get("folder_name", {}).get("invoice_display", "digits_only")
+        return invoice_display_value(invoice_no, mode)
+
+    def evaluate_invoice(
+        self,
+        invoice_no: str,
+        folder_path: str | None = None,
+        allow_prompt: bool = False,
+        allow_rename: bool = False,
+        save_report: bool = False,
+        persist_declaration: bool = True,
+        prompt_callback=None,
+    ) -> dict:
+        with self.lock:
+            folder_path = normalize_path(folder_path) if folder_path else ""
+            if not folder_path or not os.path.isdir(folder_path):
+                folder_path = self.resolve_target_folder(invoice_no)
+            if not os.path.isdir(folder_path):
+                return {
+                    "发票号": invoice_no,
+                    "最终发票号显示值": self.invoice_display(invoice_no),
+                    "报关号": "",
+                    "当前文件夹": "",
+                    "最终文件夹": "",
+                    "状态": "未找到文件夹",
+                    "已识别必需材料": "",
+                    "缺少材料": "",
+                    "未识别文件": "",
+                    "重复材料": "",
+                    "需人工确认文件": "",
+                    "闭环状态": "",
+                    "闭环分数": "",
+                    "闭环证据": "",
+                    "闭环冲突": "",
+                    "是否已改名": "否",
+                    "最后更新时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "备注": "输出目录中未找到该发票号文件夹",
+                }
+
+            record, classifications = self._build_record(
+                invoice_no,
+                folder_path,
+                persist_declaration=persist_declaration,
+            )
+
+            if allow_prompt and record["状态"] == "待输入报关号" and prompt_callback:
+                declaration_no = prompt_callback(invoice_no)
+                if declaration_no:
+                    declaration_no = sanitize_folder_name(declaration_no)
+                    if persist_declaration:
+                        self.declarations[invoice_no] = declaration_no
+                        self._save_declarations()
+                    record, classifications = self._build_record(
+                        invoice_no,
+                        folder_path,
+                        persist_declaration=persist_declaration,
+                        declaration_override=declaration_no,
+                    )
+                    record["备注"] = "报关号由用户手动输入"
+
+            if allow_rename and record["状态"] == "可改名":
+                record = self._rename_complete_folder(record, classifications)
+
+            if save_report:
+                self._save_report_record(record)
+            return record
+
+    def process_invoice(self, invoice_no: str, folder_path: str, prompt_callback=None) -> dict:
+        return self.evaluate_invoice(
+            invoice_no,
+            folder_path,
+            allow_prompt=True,
+            allow_rename=True,
+            save_report=True,
+            persist_declaration=True,
+            prompt_callback=prompt_callback,
+        )
+
+    def process_all_invoice_folders(self, invoice_numbers: list[str], prompt_callback=None, log_callback=None):
+        for invoice_no in invoice_numbers:
+            folder = self.resolve_target_folder(invoice_no)
+            if not os.path.isdir(folder):
+                continue
+            record = self.process_invoice(invoice_no, folder, prompt_callback=prompt_callback)
+            if record and log_callback:
+                log_callback(f"📋 判断报告: {invoice_no} | {record.get('状态', '')}")
+
+    def _build_record(
+        self,
+        invoice_no: str,
+        folder_path: str,
+        persist_declaration: bool = True,
+        declaration_override: str = "",
+    ) -> tuple[dict, list[dict]]:
+        files = [
+            os.path.join(folder_path, name)
+            for name in os.listdir(folder_path)
+            if os.path.isfile(os.path.join(folder_path, name)) and not should_ignore_file(os.path.join(folder_path, name))
+        ]
+        classifications = [
+            self.classifier.classify_file(path, invoice_no)
+            for path in files
+        ]
+        for item in classifications:
+            if item["status"] != "matched":
+                item["fields"] = {}
+                continue
+            material = item.get("material") or {}
+            if not material.get("file_name_only"):
+                item["text"] = item.get("text") or self._document_text(item["path"])
+            item["fields"] = extract_document_fields(item["material_id"], item.get("text", ""), item["filename"])
+
+        required_names = self.classifier.required_names()
+        matched_required = {}
+        duplicates = []
+        unrecognized = []
+        manual_review = []
+        declaration_text = ""
+
+        for item in classifications:
+            if item["status"] == "manual_review":
+                manual_review.append(item["filename"])
+                continue
+            if item["status"] != "matched":
+                unrecognized.append(item["filename"])
+                continue
+            if item["material_id"] == "customs_power_of_attorney" and item.get("text"):
+                declaration_text += "\n" + item["text"]
+            if not item["required"]:
+                continue
+            name = item["material_name"]
+            if name in matched_required:
+                duplicates.append(item["filename"])
+            else:
+                matched_required[name] = item["filename"]
+
+        missing = [name for name in required_names if name not in matched_required]
+        declaration_no = (
+            declaration_override
+            or self.declarations.get(invoice_no, "")
+            or extract_declaration_number(declaration_text)
+        )
+        if declaration_no:
+            declaration_no = sanitize_folder_name(declaration_no)
+            if persist_declaration:
+                self.declarations[invoice_no] = declaration_no
+                self._save_declarations()
+
+        ledger_record = self._ledger_record(invoice_no)
+        closed_loop = evaluate_closed_loop(invoice_no, ledger_record, classifications, declaration_no)
+
+        if missing:
+            status = "缺材料"
+        elif manual_review:
+            status = "待复核"
+        elif not declaration_no:
+            status = "待输入报关号"
+        elif closed_loop["status"] in {"strong_pass", "basic_pass"}:
+            status = "可改名"
+        elif closed_loop["status"] == "review":
+            status = "待复核"
+        else:
+            status = "不通过"
+
+        current_folder_name = os.path.basename(folder_path)
+        final_folder = self._final_folder_path(invoice_no, declaration_no) if declaration_no else ""
+        if declaration_no and current_folder_name == os.path.basename(final_folder):
+            status = "已改名"
+
+        record = {
+            "发票号": invoice_no,
+            "最终发票号显示值": self.invoice_display(invoice_no),
+            "报关号": declaration_no,
+            "当前文件夹": folder_path,
+            "最终文件夹": final_folder,
+            "状态": status,
+            "已识别必需材料": "、".join(sorted(matched_required.keys())),
+            "缺少材料": "、".join(missing),
+            "未识别文件": "、".join(unrecognized),
+            "重复材料": "、".join(duplicates),
+            "需人工确认文件": "、".join(manual_review),
+            "闭环状态": closed_loop["status_label"],
+            "闭环分数": closed_loop["score"],
+            "闭环证据": "；".join(closed_loop["evidence"]),
+            "闭环冲突": "；".join(closed_loop["conflicts"]),
+            "是否已改名": "是" if status == "已改名" else "否",
+            "最后更新时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "备注": "",
+        }
+        return record, classifications
+
+    def _ledger_record(self, invoice_no: str) -> dict:
+        if invoice_no in self.ledger_records:
+            return self.ledger_records[invoice_no]
+        for key, record in self.ledger_records.items():
+            if invoice_equivalent(key, invoice_no):
+                return record
+        return {}
+
+    @staticmethod
+    def _document_text(filepath: str) -> str:
+        text = pdf_text(filepath, max_pages=10)
+        if text:
+            return text
+        suffix = Path(filepath).suffix.lower()
+        if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".pdf"}:
+            return ocr_text(filepath)
+        return ""
+
+    def _final_folder_path(self, invoice_no: str, declaration_no: str) -> str:
+        separator = self.config.get("folder_name", {}).get("separator", "   ")
+        folder_name = sanitize_folder_name(f"{declaration_no}{separator}{self.invoice_display(invoice_no)}")
+        return os.path.join(self.output_dir, folder_name)
+
+    def _rename_complete_folder(self, record: dict, classifications: list[dict]) -> dict:
+        source_folder = record["当前文件夹"]
+        final_folder = self._final_folder_path(record["发票号"], record["报关号"])
+        final_folder = unique_path(final_folder) if not paths_equal(source_folder, final_folder) else final_folder
+        manifest = {
+            "发票号": record["发票号"],
+            "报关号": record["报关号"],
+            "源文件夹": source_folder,
+            "目标文件夹": final_folder,
+            "生成时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "文件": [],
+        }
+
+        try:
+            used_targets = set()
+            for item in classifications:
+                if item["status"] != "matched":
+                    continue
+                target_name = self._target_filename(item, record["发票号"])
+                if not target_name:
+                    continue
+                target_path = os.path.join(source_folder, target_name)
+                if os.path.basename(target_path) in used_targets:
+                    target_path = unique_path(target_path)
+                elif os.path.exists(target_path) and not paths_equal(item["path"], target_path):
+                    target_path = unique_path(target_path)
+                used_targets.add(os.path.basename(target_path))
+                manifest["文件"].append({
+                    "材料类型": item["material_name"],
+                    "原文件": item["path"],
+                    "目标文件": target_path,
+                    "状态": "待改名",
+                })
+
+            manifest_path = os.path.join(source_folder, f"rename_manifest_{record['发票号']}.json")
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+            for file_record in manifest["文件"]:
+                src = file_record["原文件"]
+                dst = file_record["目标文件"]
+                if paths_equal(src, dst):
+                    file_record["状态"] = "无需改名"
+                    continue
+                os.rename(src, dst)
+                file_record["状态"] = "已改名"
+                file_record["原文件"] = dst
+
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+            if not paths_equal(source_folder, final_folder):
+                os.rename(source_folder, final_folder)
+
+            record["当前文件夹"] = final_folder
+            record["最终文件夹"] = final_folder
+            record["状态"] = "已改名"
+            record["是否已改名"] = "是"
+            record["备注"] = "已按报关号和发票号完成文件夹与文件改名"
+        except Exception as exc:
+            record["状态"] = "改名失败"
+            record["备注"] = str(exc)
+            logging.error(f"退税材料改名失败: {record['发票号']} | {exc}")
+        return record
+
+    def _target_filename(self, item: dict, invoice_no: str) -> str:
+        suffix = Path(item["filename"]).suffix
+        material = item["material"] or {}
+        if item["material_id"] == "purchase_contract":
+            return strip_invoice_prefix(item["filename"], invoice_no)
+        return f"{material.get('final_name') or item['material_name']}{suffix}"
+
+    def _load_declarations(self) -> dict:
+        if not os.path.exists(self.declaration_path):
+            return {}
+        try:
+            with open(self.declaration_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_declarations(self):
+        tmp_path = f"{self.declaration_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(self.declarations, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, self.declaration_path)
+
+    def _save_report_record(self, record: dict):
+        today = date.today().strftime("%Y-%m-%d")
+        json_path = os.path.join(self.output_dir, f"判断报告_{today}.json")
+        records = []
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    records = data
+            except json.JSONDecodeError:
+                backup = f"{json_path}.bak_{int(time.time())}"
+                os.replace(json_path, backup)
+
+        by_invoice = {
+            rec.get("发票号"): rec
+            for rec in records
+            if isinstance(rec, dict) and rec.get("发票号")
+        }
+        by_invoice[record["发票号"]] = record
+        records = list(by_invoice.values())
+
+        tmp_path = f"{json_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, json_path)
+        self._save_report_excel(records, os.path.join(self.output_dir, f"判断报告_{today}.xlsx"))
+
+    def _save_report_excel(self, records: list[dict], path: str):
+        if openpyxl is None:
+            return
+        headers = [
+            "发票号", "最终发票号显示值", "报关号", "当前文件夹", "最终文件夹",
+            "状态", "已识别必需材料", "缺少材料", "未识别文件", "重复材料",
+            "需人工确认文件", "闭环状态", "闭环分数", "闭环证据", "闭环冲突",
+            "是否已改名", "最后更新时间", "备注",
+        ]
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "判断报告"
+        ws.append(headers)
+        ExcelLogger._style_header(ws, headers)
+        for record in sorted(records, key=lambda item: item.get("发票号", "")):
+            ws.append([record.get(header, "") for header in headers])
+        widths = [16, 18, 24, 45, 45, 14, 28, 28, 38, 28, 38, 16, 12, 55, 45, 12, 22, 40]
+        for col_idx, width in enumerate(widths, start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
+        wb.save(path)
+        wb.close()
+
+
+# ─────────────────────────────────────────────
+# 工作日志管理器
+# ─────────────────────────────────────────────
+
+class ExcelLogger:
+    def __init__(self, output_dir: str):
+        self.output_dir = output_dir
+        self.lock = threading.Lock()
+        self._records: list[dict] = []
+
+    def add_record(
+        self,
+        filename: str,
+        subfolder: str,
+        status: str,
+        invoice_no: str = "",
+        source_path: str = "",
+        dest_path: str = "",
+        message: str = "",
+    ):
+        with self.lock:
+            self._records.append({
+                "记录ID": f"{time.time_ns()}-{threading.get_ident()}",
+                "文件名": filename,
+                "归入子文件夹": subfolder,
+                "处理日期": date.today().strftime("%Y-%m-%d"),
+                "处理时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "发票号": invoice_no,
+                "状态": status,
+                "源路径": source_path,
+                "目标路径": dest_path,
+                "说明": message,
+            })
+
+    def save(self):
+        """将新增记录写入 JSON 工作日志，并同步追加到 Excel 日志。"""
+        with self.lock:
+            records = list(self._records)
+            if not records:
+                return
+
+            try:
+                self._append_json_records(records)
+                self._append_excel_records(records)
+            except Exception as e:
+                logging.error(f"工作日志保存失败: {e}")
+                return
+
+            del self._records[:len(records)]
+
+    def _append_json_records(self, records: list[dict]):
+        today_str = date.today().strftime("%Y-%m-%d")
+        log_path = os.path.join(self.output_dir, f"工作日志_{today_str}.json")
+        existing_records = []
+
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    existing_records = data
+            except json.JSONDecodeError:
+                backup_path = f"{log_path}.bak_{int(time.time())}"
+                os.replace(log_path, backup_path)
+                logging.error(f"JSON 工作日志损坏，已备份为: {backup_path}")
+
+        seen_ids = {
+            rec.get("记录ID")
+            for rec in existing_records
+            if isinstance(rec, dict) and rec.get("记录ID")
+        }
+        for rec in records:
+            if rec["记录ID"] not in seen_ids:
+                existing_records.append(rec)
+                seen_ids.add(rec["记录ID"])
+
+        tmp_path = f"{log_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(existing_records, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, log_path)
+
+    def _append_excel_records(self, records: list[dict]):
+        if openpyxl is None:
+            return
+
+        today_str = date.today().strftime("%Y-%m-%d")
+        log_path = os.path.join(self.output_dir, f"工作日志_{today_str}.xlsx")
+
+        if os.path.exists(log_path):
+            wb = openpyxl.load_workbook(log_path)
+            ws_detail = wb["处理明细"] if "处理明细" in wb.sheetnames else wb.create_sheet("处理明细")
+            ws_summary = wb["汇总统计"] if "汇总统计" in wb.sheetnames else wb.create_sheet("汇总统计")
+        else:
+            wb = openpyxl.Workbook()
+            ws_detail = wb.active
+            ws_detail.title = "处理明细"
+            ws_summary = wb.create_sheet("汇总统计")
+
+        # ── 处理明细 Sheet ──
+        if ws_detail.max_row <= 1:
+            headers = ["序号", "文件名", "归入子文件夹", "处理时间", "状态"]
+            ws_detail.append(headers)
+            self._style_header(ws_detail, headers)
+
+        start_row = ws_detail.max_row + 1
+        for i, rec in enumerate(records, start=start_row):
+            ws_detail.append([
+                i - 1,
+                rec["文件名"],
+                rec["归入子文件夹"],
+                rec["处理时间"],
+                rec["状态"],
+            ])
+
+        # 设置列宽
+        col_widths = [8, 45, 20, 22, 40]
+        for col_idx, width in enumerate(col_widths, start=1):
+            ws_detail.column_dimensions[
+                openpyxl.utils.get_column_letter(col_idx)
+            ].width = width
+
+        # ── 汇总统计 Sheet ──
+        all_records = []
+        for row in ws_detail.iter_rows(min_row=2, values_only=True):
+            if row[2]:
+                all_records.append(row[2])
+
+        folder_count: dict = {}
+        for sf in all_records:
+            folder_count[sf] = folder_count.get(sf, 0) + 1
+
+        ws_summary.delete_rows(1, ws_summary.max_row + 1)
+        summary_headers = ["子文件夹名称", "文件数量"]
+        ws_summary.append(summary_headers)
+        self._style_header(ws_summary, summary_headers)
+
+        for sf, cnt in sorted(folder_count.items(), key=lambda x: -x[1]):
+            ws_summary.append([sf, cnt])
+
+        total = sum(folder_count.values())
+        total_row = ws_summary.max_row + 1
+        ws_summary.cell(row=total_row, column=1, value="【合计】")
+        ws_summary.cell(row=total_row, column=2, value=total)
+        bold = Font(bold=True, color="C0392B")
+        ws_summary.cell(row=total_row, column=1).font = bold
+        ws_summary.cell(row=total_row, column=2).font = bold
+
+        ws_summary.column_dimensions["A"].width = 22
+        ws_summary.column_dimensions["B"].width = 14
+
+        wb.save(log_path)
+        wb.close()
+
+    @staticmethod
+    def _style_header(ws, headers):
+        header_fill = PatternFill("solid", fgColor="2E86AB")
+        header_font = Font(bold=True, color="FFFFFF")
+        header_align = Alignment(horizontal="center", vertical="center")
+        thin = Side(style="thin", color="AAAAAA")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_align
+            cell.border = border
+
+
+def backup_excel_file(path: str) -> str:
+    source = Path(path)
+    if not source.exists():
+        raise FileNotFoundError(f"Excel 文件不存在：{source}")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_path = f"{source}.bak_{timestamp}"
+    shutil.copy2(source, backup_path)
+    return backup_path
+
+
+def ensure_columns(ws, headers: list[str]) -> dict:
+    existing = {}
+    max_col = max(ws.max_column, 1)
+    for col_idx in range(1, max_col + 1):
+        header = format_excel_cell(ws.cell(row=1, column=col_idx).value)
+        if header:
+            existing[header] = col_idx
+
+    next_col = max_col + 1
+    for header in headers:
+        if header not in existing:
+            ws.cell(row=1, column=next_col, value=header)
+            existing[header] = next_col
+            next_col += 1
+    return {header: existing[header] for header in headers if header in existing}
+
+
+def _invoice_header_index(headers: list[str], invoice_column_name: str = "发票号") -> int | None:
+    aliases = {invoice_column_name, "发票号", "发票号码", "Invoice", "invoice", "INV"}
+    for idx, header in enumerate(headers, start=1):
+        if header in aliases:
+            return idx
+    return None
+
+
+def _status_record_for_invoice(invoice_no: str, status_by_invoice: dict[str, dict]) -> dict | None:
+    normalized = normalize_identifier(invoice_no)
+    digits = invoice_digits(normalized)
+    for key, record in status_by_invoice.items():
+        key_norm = normalize_identifier(key)
+        if normalized and normalized == key_norm:
+            return record
+        key_digits = invoice_digits(key_norm)
+        if digits and len(digits) >= 6 and digits == key_digits:
+            return record
+    for key, record in status_by_invoice.items():
+        if invoice_equivalent(invoice_no, key):
+            return record
+    return None
+
+
+def _status_cell_values(record: dict) -> dict:
+    return {
+        "退税齐套状态": record.get("退税齐套状态") or record.get("tax_status") or record.get("状态", ""),
+        "财务批次": record.get("财务批次") or record.get("batch_name", ""),
+        "齐套检查时间": record.get("齐套检查时间") or record.get("最后更新时间", ""),
+        "缺少材料": record.get("缺少材料", ""),
+        "闭环状态": record.get("闭环状态", ""),
+        "闭环分数": record.get("闭环分数", ""),
+        "退税包路径": record.get("退税包路径") or record.get("批次包文件夹", ""),
+        "备注": record.get("备注", ""),
+    }
+
+
+def write_status_to_workbook(
+    workbook_path: str,
+    status_by_invoice: dict[str, dict],
+    invoice_column_name: str = "发票号",
+    create_backup: bool = True,
+) -> str:
+    if openpyxl is None:
+        raise RuntimeError("缺少 openpyxl，无法回写 Excel")
+    if not status_by_invoice:
+        return ""
+
+    workbook_path = normalize_path(workbook_path)
+    with EXCEL_WRITE_LOCK:
+        backup_path = backup_excel_file(workbook_path) if create_backup else ""
+        wb = None
+        tmp_path = f"{workbook_path}.tmp_{time.strftime('%Y%m%d_%H%M%S')}_{threading.get_ident()}.xlsx"
+        status_headers = [
+            "退税齐套状态",
+            "财务批次",
+            "齐套检查时间",
+            "缺少材料",
+            "闭环状态",
+            "闭环分数",
+            "退税包路径",
+            "备注",
+        ]
+
+        try:
+            wb = openpyxl.load_workbook(workbook_path)
+            for ws in wb.worksheets:
+                headers = [
+                    format_excel_cell(ws.cell(row=1, column=col_idx).value)
+                    for col_idx in range(1, max(ws.max_column, 1) + 1)
+                ]
+                invoice_col = _invoice_header_index(headers, invoice_column_name)
+                data_start_row = 2
+                if invoice_col is None:
+                    ws.insert_rows(1)
+                    ws.cell(row=1, column=1, value=invoice_column_name)
+                    invoice_col = 1
+                    data_start_row = 2
+
+                columns = ensure_columns(ws, status_headers)
+                for row_idx in range(data_start_row, ws.max_row + 1):
+                    invoice_no = format_excel_cell(ws.cell(row=row_idx, column=invoice_col).value)
+                    if not invoice_no:
+                        continue
+                    status_record = _status_record_for_invoice(invoice_no, status_by_invoice)
+                    if not status_record:
+                        continue
+                    values = _status_cell_values(status_record)
+                    for header in status_headers:
+                        ws.cell(row=row_idx, column=columns[header], value=values.get(header, ""))
+
+            wb.save(tmp_path)
+            wb.close()
+            wb = None
+            os.replace(tmp_path, workbook_path)
+            return backup_path
+        except (PermissionError, OSError) as exc:
+            raise RuntimeError("Excel 文件可能正在被打开，请关闭后重试") from exc
+        finally:
+            if wb is not None:
+                wb.close()
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+
+def load_finance_batch_invoices(batch_workbook_path: str) -> list[dict]:
+    if openpyxl is None:
+        raise RuntimeError("缺少 openpyxl，无法读取财务批次表")
+
+    records = []
+    seen = set()
+    wb = openpyxl.load_workbook(batch_workbook_path, read_only=True, data_only=True)
+    try:
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            headers = [format_excel_cell(value) for value in rows[0]]
+            invoice_idx = None
+            for idx, header in enumerate(headers):
+                if header == "发票号":
+                    invoice_idx = idx
+                    break
+            start_idx = 1 if invoice_idx is not None else 0
+            if invoice_idx is None:
+                invoice_idx = 0
+
+            for offset, row in enumerate(rows[start_idx:], start=start_idx + 1):
+                invoice_no = format_excel_cell(row[invoice_idx] if invoice_idx < len(row) else "").strip()
+                if not invoice_no:
+                    continue
+                key = invoice_dedup_key(invoice_no)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append({
+                    "invoice_no": invoice_no,
+                    "sheet": ws.title,
+                    "row": offset,
+                })
+    finally:
+        wb.close()
+    return records
+
+
+def tax_status_from_record(record: dict, in_ledger: bool, folder_exists: bool) -> str:
+    if not in_ledger:
+        return "不在主台账"
+    if not folder_exists:
+        return "未找到文件夹"
+    if str(record.get("缺少材料", "")).strip():
+        return "缺材料"
+    if str(record.get("需人工确认文件", "")).strip():
+        return "待复核"
+
+    status = str(record.get("状态", "")).strip()
+    if status == "不通过":
+        return "不通过"
+    if status in {"待输入报关号", "待复核", "改名失败"}:
+        return "待复核"
+    if record.get("闭环状态") in {"强闭环通过", "基本闭环通过"}:
+        return "齐了"
+    return "待复核"
+
+
+def _batch_summary_counts(records: list[dict]) -> dict:
+    keys = ["齐了", "缺材料", "待复核", "未找到文件夹", "不在主台账", "不通过"]
+    counts = {key: 0 for key in keys}
+    other = 0
+    for record in records:
+        status = record.get("退税齐套状态", "")
+        if status in counts:
+            counts[status] += 1
+        else:
+            other += 1
+    counts["其他"] = other
+    return counts
+
+
+def save_batch_report_json(records: list[dict], path: str):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def save_batch_report_excel(records: list[dict], path: str):
+    if openpyxl is None:
+        raise RuntimeError("缺少 openpyxl，无法生成批次统计报告")
+
+    headers = [
+        "序号",
+        "发票号",
+        "是否在主台账",
+        "是否找到文件夹",
+        "退税齐套状态",
+        "原文件夹",
+        "批次包文件夹",
+        "已识别必需材料",
+        "缺少材料",
+        "未识别文件",
+        "重复材料",
+        "需人工确认文件",
+        "闭环状态",
+        "闭环分数",
+        "闭环证据",
+        "闭环冲突",
+        "报关号",
+        "最后更新时间",
+        "备注",
+    ]
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    wb = openpyxl.Workbook()
+    ws_detail = wb.active
+    ws_detail.title = "批次明细"
+    ws_detail.append(headers)
+    ExcelLogger._style_header(ws_detail, headers)
+    for record in records:
+        ws_detail.append([record.get(header, "") for header in headers])
+
+    widths = [8, 18, 14, 14, 16, 45, 45, 28, 28, 38, 28, 38, 16, 12, 55, 45, 24, 22, 45]
+    for col_idx, width in enumerate(widths, start=1):
+        ws_detail.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
+
+    ws_summary = wb.create_sheet("汇总统计")
+    summary_headers = ["项目", "数量"]
+    ws_summary.append(summary_headers)
+    ExcelLogger._style_header(ws_summary, summary_headers)
+    counts = _batch_summary_counts(records)
+    summary_rows = [
+        ("总发票数", len(records)),
+        ("齐了", counts["齐了"]),
+        ("缺材料", counts["缺材料"]),
+        ("待复核", counts["待复核"]),
+        ("未找到文件夹", counts["未找到文件夹"]),
+        ("不在主台账", counts["不在主台账"]),
+        ("不通过", counts["不通过"]),
+        ("其他", counts["其他"]),
+    ]
+    for row in summary_rows:
+        ws_summary.append(row)
+    ws_summary.column_dimensions["A"].width = 20
+    ws_summary.column_dimensions["B"].width = 12
+
+    tmp_path = f"{path}.tmp"
+    wb.save(tmp_path)
+    wb.close()
+    os.replace(tmp_path, path)
+
+
+def _find_equivalent_invoice_key(records: dict[str, dict], invoice_no: str) -> str:
+    if invoice_no in records:
+        return invoice_no
+    for key in records:
+        if invoice_equivalent(key, invoice_no):
+            return key
+    return ""
+
+
+def copy_invoice_folder(source_folder: str, batch_output_dir: str, invoice_no: str, record: dict) -> str:
+    del invoice_no, record
+    source_folder = normalize_path(source_folder)
+    batch_output_dir = normalize_path(batch_output_dir)
+    os.makedirs(batch_output_dir, exist_ok=True)
+    target_folder = unique_path(os.path.join(batch_output_dir, os.path.basename(source_folder)))
+
+    def ignore_batch_irrelevant(directory, names):
+        ignored = []
+        for name in names:
+            path = os.path.join(directory, name)
+            if (
+                name == "declaration_overrides.json"
+                or name.startswith(("工作日志_", "判断报告_", "rename_manifest_"))
+                or should_ignore_file(path)
+            ):
+                ignored.append(name)
+        return ignored
+
+    shutil.copytree(source_folder, target_folder, ignore=ignore_batch_irrelevant)
+    return target_folder
+
+
+class FinanceBatchProcessor:
+    def __init__(
+        self,
+        output_dir: str,
+        company_ledger_path: str,
+        tax_processor: TaxRefundProcessor,
+        settings: dict,
+        log_callback=None,
+    ):
+        self.output_dir = normalize_path(output_dir)
+        self.company_ledger_path = normalize_path(company_ledger_path)
+        self.tax_processor = tax_processor
+        self.settings = settings or default_app_settings()
+        self.log_callback = log_callback
+
+    def _log(self, message: str):
+        if self.log_callback:
+            self.log_callback(message)
+
+    def build_batch_output_dir(self, batch_workbook_path: str) -> str:
+        finance_settings = self.settings.get("finance_batch", {})
+        output_subdir = (
+            finance_settings.get("output_subdir")
+            or finance_settings.get("default_output_subdir")
+            or "财务退税批次包"
+        )
+        batch_name = sanitize_folder_name(Path(batch_workbook_path).stem)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        return os.path.join(self.output_dir, output_subdir, f"{batch_name}_{timestamp}")
+
+    def process_batch(self, batch_workbook_path: str) -> dict:
+        batch_workbook_path = normalize_path(batch_workbook_path)
+        if not os.path.isfile(batch_workbook_path):
+            raise FileNotFoundError(f"财务批次表不存在：{batch_workbook_path}")
+
+        batch_items = load_finance_batch_invoices(batch_workbook_path)
+        if not batch_items:
+            raise RuntimeError("财务批次表中没有读取到发票号")
+
+        ledger_records = load_invoice_records(self.company_ledger_path)
+        self.tax_processor.ledger_records = ledger_records
+        batch_output_dir = self.build_batch_output_dir(batch_workbook_path)
+        os.makedirs(batch_output_dir, exist_ok=True)
+        batch_name = os.path.basename(batch_output_dir)
+
+        self._log(f"📦 财务批次处理开始：{Path(batch_workbook_path).name}，共 {len(batch_items)} 个发票号")
+        records = []
+        status_by_invoice = {}
+
+        for index, item in enumerate(batch_items, start=1):
+            requested_invoice = item["invoice_no"].strip()
+            ledger_key = _find_equivalent_invoice_key(ledger_records, requested_invoice)
+            in_ledger = bool(ledger_key)
+            eval_invoice = ledger_key or requested_invoice
+            source_folder = self.tax_processor.resolve_target_folder(eval_invoice)
+            folder_exists = os.path.isdir(source_folder)
+
+            record = self.tax_processor.evaluate_invoice(
+                eval_invoice,
+                source_folder if folder_exists else None,
+                allow_prompt=False,
+                allow_rename=False,
+                save_report=False,
+                persist_declaration=False,
+            )
+            copied_folder = ""
+            if folder_exists:
+                copied_folder = copy_invoice_folder(source_folder, batch_output_dir, eval_invoice, record)
+
+            tax_status = tax_status_from_record(record, in_ledger=in_ledger, folder_exists=folder_exists)
+            remarks = [record.get("备注", "")]
+            if not in_ledger:
+                remarks.append("财务批次发票号不在公司系统主台账")
+            remarks = "；".join(item for item in remarks if item)
+
+            batch_record = {
+                "序号": index,
+                "发票号": requested_invoice,
+                "是否在主台账": "是" if in_ledger else "否",
+                "是否找到文件夹": "是" if folder_exists else "否",
+                "退税齐套状态": tax_status,
+                "原文件夹": source_folder if folder_exists else "",
+                "批次包文件夹": copied_folder,
+                "退税包路径": copied_folder,
+                "财务批次": batch_name,
+                "齐套检查时间": record.get("最后更新时间", ""),
+                "已识别必需材料": record.get("已识别必需材料", ""),
+                "缺少材料": record.get("缺少材料", ""),
+                "未识别文件": record.get("未识别文件", ""),
+                "重复材料": record.get("重复材料", ""),
+                "需人工确认文件": record.get("需人工确认文件", ""),
+                "闭环状态": record.get("闭环状态", ""),
+                "闭环分数": record.get("闭环分数", ""),
+                "闭环证据": record.get("闭环证据", ""),
+                "闭环冲突": record.get("闭环冲突", ""),
+                "报关号": record.get("报关号", ""),
+                "最后更新时间": record.get("最后更新时间", ""),
+                "备注": remarks,
+                "batch_source_sheet": item.get("sheet", ""),
+                "batch_source_row": item.get("row", ""),
+            }
+            records.append(batch_record)
+            status_by_invoice[requested_invoice] = batch_record
+            status_by_invoice[eval_invoice] = batch_record
+
+            if index % 20 == 0 or index == len(batch_items):
+                self._log(f"📦 财务批次进度：{index}/{len(batch_items)}")
+
+        report_xlsx = os.path.join(batch_output_dir, "批次统计报告.xlsx")
+        report_json = os.path.join(batch_output_dir, "批次统计报告.json")
+        save_batch_report_excel(records, report_xlsx)
+        save_batch_report_json(records, report_json)
+
+        finance_settings = self.settings.get("finance_batch", {})
+        marked_batch_copy = ""
+        if finance_settings.get("create_marked_batch_copy", True):
+            marked_batch_copy = os.path.join(
+                batch_output_dir,
+                f"{sanitize_folder_name(Path(batch_workbook_path).stem)}_已标注.xlsx",
+            )
+            shutil.copy2(batch_workbook_path, marked_batch_copy)
+            write_status_to_workbook(marked_batch_copy, status_by_invoice, create_backup=False)
+
+        company_backup = ""
+        finance_backup = ""
+        if finance_settings.get("write_back_company_ledger", True):
+            company_backup = write_status_to_workbook(self.company_ledger_path, status_by_invoice)
+        if finance_settings.get("write_back_finance_batch", True):
+            finance_backup = write_status_to_workbook(batch_workbook_path, status_by_invoice)
+
+        finance_settings["last_batch_workbook_path"] = batch_workbook_path
+        finance_settings["last_batch_name"] = batch_name
+        finance_settings["last_batch_output_dir"] = batch_output_dir
+        self.settings["finance_batch"] = finance_settings
+        save_app_settings(self.settings, APP_SETTINGS_PATH)
+
+        counts = _batch_summary_counts(records)
+        summary = {
+            "batch_name": batch_name,
+            "total": len(records),
+            "counts": counts,
+            "batch_output_dir": batch_output_dir,
+            "report_xlsx": report_xlsx,
+            "report_json": report_json,
+            "marked_batch_copy": marked_batch_copy,
+            "company_ledger_backup": company_backup,
+            "finance_batch_backup": finance_backup,
+        }
+        self._log(f"📦 财务批次处理完成：{batch_output_dir}")
+        return summary
+
+
+def sync_single_invoice_status_to_company_ledger(
+    invoice_no: str,
+    record: dict,
+    company_ledger_path: str,
+    batch_name: str = "",
+    create_backup: bool = True,
+):
+    ledger_records = load_invoice_records(company_ledger_path)
+    in_ledger = bool(_find_equivalent_invoice_key(ledger_records, invoice_no))
+    folder_exists = bool(record.get("当前文件夹") and os.path.isdir(record.get("当前文件夹")))
+    tax_status = tax_status_from_record(record, in_ledger=in_ledger, folder_exists=folder_exists)
+    status_record = dict(record)
+    status_record["退税齐套状态"] = tax_status
+    status_record["财务批次"] = batch_name
+    status_record["齐套检查时间"] = record.get("最后更新时间", "")
+    return write_status_to_workbook(company_ledger_path, {invoice_no: status_record}, create_backup=create_backup)
+
+
+class CompanyLedgerSyncManager:
+    def __init__(
+        self,
+        company_ledger_path: str,
+        batch_name: str = "",
+        log_callback=None,
+        debounce_seconds: float = 5.0,
+    ):
+        self.company_ledger_path = company_ledger_path
+        self.batch_name = batch_name
+        self.log_callback = log_callback
+        self.debounce_seconds = max(0.1, float(debounce_seconds))
+        self._pending: dict[str, dict] = {}
+        self._timer: threading.Timer | None = None
+        self._backup_dates: set[str] = set()
+        self._lock = threading.Lock()
+
+    def enqueue(self, invoice_no: str, record: dict):
+        if not invoice_no or not record:
+            return
+        with self._lock:
+            self._pending[invoice_no] = dict(record)
+            if self._timer:
+                self._timer.cancel()
+            self._timer = threading.Timer(self.debounce_seconds, self.flush)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def flush(self):
+        with self._lock:
+            timer = self._timer
+            self._timer = None
+            if timer:
+                timer.cancel()
+            pending = dict(self._pending)
+            self._pending.clear()
+
+        if not pending:
+            return
+
+        try:
+            ledger_records = load_invoice_records(self.company_ledger_path)
+            status_by_invoice = {}
+            for invoice_no, record in pending.items():
+                in_ledger = bool(_find_equivalent_invoice_key(ledger_records, invoice_no))
+                folder_exists = bool(record.get("当前文件夹") and os.path.isdir(record.get("当前文件夹")))
+                status_record = dict(record)
+                status_record["退税齐套状态"] = tax_status_from_record(
+                    record,
+                    in_ledger=in_ledger,
+                    folder_exists=folder_exists,
+                )
+                status_record["财务批次"] = self.batch_name
+                status_record["齐套检查时间"] = record.get("最后更新时间", "")
+                status_by_invoice[invoice_no] = status_record
+
+            today = date.today().isoformat()
+            create_backup = today not in self._backup_dates
+            backup_path = write_status_to_workbook(
+                self.company_ledger_path,
+                status_by_invoice,
+                create_backup=create_backup,
+            )
+            if create_backup:
+                self._backup_dates.add(today)
+            if self.log_callback:
+                backup_text = f"，备份: {backup_path}" if backup_path else ""
+                self.log_callback(f"📒 公司主台账状态已批量同步 {len(status_by_invoice)} 票{backup_text}")
+        except Exception as exc:
+            if self.log_callback:
+                self.log_callback(f"⚠ 公司主台账状态同步失败: {exc}")
+
+    def close(self, flush: bool = True):
+        if flush:
+            self.flush()
+            return
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            self._pending.clear()
+
+
+# ─────────────────────────────────────────────
+# 文件监控处理器
+# ─────────────────────────────────────────────
+
+class FileHandler(FileSystemEventHandler if Observer else object):
+    def __init__(self, output_dir: str, excel_logger: ExcelLogger,
+                 invoice_matcher: InvoiceMatcher, executor: ThreadPoolExecutor,
+                 log_callback, pending_set: set, tax_processor: TaxRefundProcessor = None,
+                 declaration_prompt_callback=None, company_ledger_path: str = "",
+                 finance_batch_name: str = "", ledger_sync_manager: CompanyLedgerSyncManager = None):
+        if Observer:
+            super().__init__()
+        self.output_dir = output_dir
+        self.excel_logger = excel_logger
+        self.invoice_matcher = invoice_matcher
+        self.executor = executor
+        self.log_callback = log_callback
+        self.pending_set = pending_set   # 正在处理的文件路径集合
+        self.tax_processor = tax_processor
+        self.declaration_prompt_callback = declaration_prompt_callback
+        self.company_ledger_path = company_ledger_path
+        self.finance_batch_name = finance_batch_name
+        self.ledger_sync_manager = ledger_sync_manager
+        self._lock = threading.Lock()
+
+    def on_closed(self, event):
+        """文件关闭（写入完成）时触发（watchdog >= 2.1）"""
+        if not event.is_directory:
+            self._schedule(event.src_path)
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._schedule(event.src_path)
+
+    def _schedule(self, filepath: str):
+        if should_ignore_file(filepath):
+            return False
+        filepath = normalize_path(filepath)
+        with self._lock:
+            if filepath in self.pending_set:
+                return False
+            self.pending_set.add(filepath)
+        try:
+            self.executor.submit(self._process, filepath)
+            return True
+        except RuntimeError:
+            with self._lock:
+                self.pending_set.discard(filepath)
+            return False
+
+    def _process(self, filepath: str):
+        filename = os.path.basename(filepath)
+        try:
+            # 等待文件写入完成
+            ready, reason = wait_for_file_ready(
+                filepath,
+                timeout_seconds=30.0,
+                poll_interval=1.0,
+                stable_checks=2,
+            )
+            if not ready:
+                msg = f"文件未就绪，已放弃: {filename} | {reason}"
+                self.log_callback(f"⚠ {msg}")
+                self.excel_logger.add_record(
+                    filename,
+                    "",
+                    "失败",
+                    source_path=filepath,
+                    message=msg,
+                )
+                self.excel_logger.save()
+                return
+
+            success, subfolder, msg, dest_path, invoice_no, status = move_file_to_output(
+                filepath,
+                self.output_dir,
+                self.invoice_matcher,
+                invoice_dir_resolver=(
+                    self.tax_processor.resolve_target_folder
+                    if self.tax_processor
+                    else None
+                ),
+            )
+            if success and status == "成功":
+                self.log_callback(f"✅ {msg}", processed=True)
+            elif success:
+                self.log_callback(f"⚠ {msg}", processed=True)
+            else:
+                self.log_callback(f"❌ {msg}")
+            self.excel_logger.add_record(
+                filename,
+                subfolder,
+                status if success else msg,
+                invoice_no=invoice_no,
+                source_path=filepath,
+                dest_path=dest_path,
+                message=msg,
+            )
+            # 每处理一个文件就保存一次日志（保证实时性）
+            self.excel_logger.save()
+
+            if success and invoice_no and self.tax_processor:
+                record = self.tax_processor.process_invoice(
+                    invoice_no,
+                    os.path.dirname(dest_path),
+                    prompt_callback=self.declaration_prompt_callback,
+                )
+                if record:
+                    self.log_callback(
+                        f"📋 退税材料判断: {invoice_no} | {record.get('状态', '')} | "
+                        f"缺少: {record.get('缺少材料') or '无'}"
+                    )
+                    if self.ledger_sync_manager:
+                        try:
+                            self.ledger_sync_manager.enqueue(invoice_no, record)
+                        except Exception as sync_exc:
+                            self.log_callback(f"⚠ 公司主台账状态同步失败: {invoice_no} | {sync_exc}")
+        except Exception as e:
+            msg = f"异常: {filepath} | {e}"
+            self.log_callback(f"❌ {msg}")
+            self.excel_logger.add_record(
+                filename,
+                "",
+                "失败",
+                source_path=filepath,
+                message=msg,
+            )
+            self.excel_logger.save()
+        finally:
+            with self._lock:
+                self.pending_set.discard(filepath)
+
+
+# ─────────────────────────────────────────────
+# 图形界面
+# ─────────────────────────────────────────────
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("📁 文件自动归类助手")
+        self.geometry("780x600")
+        self.resizable(True, True)
+        self.configure(bg="#F0F4F8")
+
+        # 状态变量
+        self.watch_dir = tk.StringVar()
+        self.output_dir = tk.StringVar()
+        self.is_running = False
+        self._is_stopping = False
+        self._close_after_stop = False
+        self.observer = None
+        self.executor = None
+        self.excel_logger = None
+        self.invoice_matcher = None
+        self.tax_processor = None
+        self.ledger_sync_manager = None
+        self.pending_set: set = set()
+        self._log_queue: queue.Queue = queue.Queue()
+        self._finance_batch_running = False
+
+        self._build_ui()
+        self._poll_log_queue()
+
+    # ── UI 构建 ──────────────────────────────
+
+    def _build_ui(self):
+        # 顶部标题
+        title_frame = tk.Frame(self, bg="#2E86AB", pady=12)
+        title_frame.pack(fill="x")
+        tk.Label(
+            title_frame, text="📁 文件自动归类助手",
+            font=("微软雅黑", 18, "bold"), fg="white", bg="#2E86AB"
+        ).pack()
+        tk.Label(
+            title_frame,
+            text="实时监视文件夹 · 按发票号归类 · 判断退税材料 · 自动改名",
+            font=("微软雅黑", 10), fg="#D6EAF8", bg="#2E86AB"
+        ).pack()
+
+        # 主内容区
+        content = tk.Frame(self, bg="#F0F4F8", padx=20, pady=10)
+        content.pack(fill="both", expand=True)
+
+        # 文件夹选择区
+        folder_frame = tk.LabelFrame(
+            content, text="  📂 文件夹设置  ",
+            font=("微软雅黑", 11, "bold"), bg="#F0F4F8",
+            fg="#2C3E50", padx=10, pady=8
+        )
+        folder_frame.pack(fill="x", pady=(0, 10))
+
+        # 监控文件夹
+        self._folder_row(folder_frame, "监控文件夹（待归类文件放这里）：", self.watch_dir,
+                         self._choose_watch, row=0)
+        # 输出文件夹
+        self._folder_row(folder_frame, "输出主文件夹（归类后存放位置）：", self.output_dir,
+                         self._choose_output, row=1)
+
+        # 控制按钮区
+        btn_frame = tk.Frame(content, bg="#F0F4F8")
+        btn_frame.pack(fill="x", pady=(0, 10))
+
+        self.btn_start = tk.Button(
+            btn_frame, text="▶  开始监控", font=("微软雅黑", 12, "bold"),
+            bg="#27AE60", fg="white", activebackground="#1E8449",
+            relief="flat", padx=20, pady=8, cursor="hand2",
+            command=self._start
+        )
+        self.btn_start.pack(side="left", padx=(0, 10))
+
+        self.btn_stop = tk.Button(
+            btn_frame, text="⏹  停止监控", font=("微软雅黑", 12, "bold"),
+            bg="#E74C3C", fg="white", activebackground="#C0392B",
+            relief="flat", padx=20, pady=8, cursor="hand2",
+            state="disabled", command=self._stop
+        )
+        self.btn_stop.pack(side="left", padx=(0, 10))
+
+        self.btn_finance_batch = tk.Button(
+            btn_frame, text="📦  生成财务批次包", font=("微软雅黑", 11, "bold"),
+            bg="#8E44AD", fg="white", activebackground="#6C3483",
+            relief="flat", padx=14, pady=8, cursor="hand2",
+            command=self._generate_finance_batch
+        )
+        self.btn_finance_batch.pack(side="left", padx=(0, 10))
+
+        self.btn_clear = tk.Button(
+            btn_frame, text="🗑  清空日志", font=("微软雅黑", 11),
+            bg="#95A5A6", fg="white", activebackground="#7F8C8D",
+            relief="flat", padx=14, pady=8, cursor="hand2",
+            command=self._clear_log
+        )
+        self.btn_clear.pack(side="left")
+
+        # 状态栏
+        self.status_var = tk.StringVar(value="⚫ 未启动")
+        status_bar = tk.Label(
+            btn_frame, textvariable=self.status_var,
+            font=("微软雅黑", 11), bg="#F0F4F8", fg="#7F8C8D"
+        )
+        status_bar.pack(side="right", padx=10)
+
+        # 统计信息
+        stats_frame = tk.Frame(content, bg="#F0F4F8")
+        stats_frame.pack(fill="x", pady=(0, 6))
+        self.stats_var = tk.StringVar(value="已处理文件：0 个")
+        tk.Label(
+            stats_frame, textvariable=self.stats_var,
+            font=("微软雅黑", 10), bg="#F0F4F8", fg="#2980B9"
+        ).pack(side="left")
+
+        # 日志区
+        log_frame = tk.LabelFrame(
+            content, text="  📋 运行日志  ",
+            font=("微软雅黑", 11, "bold"), bg="#F0F4F8",
+            fg="#2C3E50", padx=6, pady=6
+        )
+        log_frame.pack(fill="both", expand=True)
+
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, font=("Consolas", 9), bg="#1E2A35", fg="#ECF0F1",
+            insertbackground="white", state="disabled",
+            wrap="word", relief="flat"
+        )
+        self.log_text.pack(fill="both", expand=True)
+
+        # 底部提示
+        tip = tk.Label(
+            self, text="💡 提示：文件名需以发票号开头；发票号来自 data/公司系统出运统计发票号清单.xlsx；财务批次表请使用【生成财务批次包】按钮处理",
+            font=("微软雅黑", 9), bg="#D5E8D4", fg="#27AE60", pady=4
+        )
+        tip.pack(fill="x", side="bottom")
+
+        self._processed_count = 0
+
+    def _folder_row(self, parent, label_text, var, cmd, row):
+        tk.Label(
+            parent, text=label_text,
+            font=("微软雅黑", 10), bg="#F0F4F8", fg="#2C3E50"
+        ).grid(row=row, column=0, sticky="w", pady=4)
+
+        entry = tk.Entry(
+            parent, textvariable=var,
+            font=("微软雅黑", 10), width=42,
+            relief="solid", bd=1
+        )
+        entry.grid(row=row, column=1, padx=8, pady=4, sticky="ew")
+
+        tk.Button(
+            parent, text="浏览…", font=("微软雅黑", 10),
+            bg="#3498DB", fg="white", activebackground="#2980B9",
+            relief="flat", padx=8, cursor="hand2", command=cmd
+        ).grid(row=row, column=2, padx=(0, 4), pady=4)
+
+        parent.columnconfigure(1, weight=1)
+
+    # ── 事件处理 ─────────────────────────────
+
+    def _choose_watch(self):
+        d = filedialog.askdirectory(title="选择监控文件夹")
+        if d:
+            self.watch_dir.set(d)
+
+    def _choose_output(self):
+        d = filedialog.askdirectory(title="选择输出主文件夹")
+        if d:
+            self.output_dir.set(d)
+
+    def _generate_finance_batch(self):
+        if self._finance_batch_running:
+            return
+        if openpyxl is None:
+            messagebox.showerror("缺少依赖", "请先安装 openpyxl：\npip install openpyxl")
+            return
+
+        output = self.output_dir.get().strip()
+        if not output or not os.path.isdir(output):
+            messagebox.showwarning("提示", "请先选择有效的输出主文件夹！")
+            return
+        output = normalize_path(output)
+
+        if self.is_running:
+            messagebox.showinfo(
+                "提示",
+                "当前正在监控文件夹。财务批次处理会复制文件夹，不会停止监控；"
+                "如果 Excel 或材料文件正在被占用，可能需要关闭后重试。",
+            )
+
+        batch_path = filedialog.askopenfilename(
+            title="选择财务批次发票号 Excel",
+            filetypes=[("Excel 工作簿", "*.xlsx")],
+        )
+        if not batch_path:
+            return
+
+        self._finance_batch_running = True
+        self.btn_finance_batch.config(state="disabled")
+        self._enqueue_log(f"📦 已选择财务批次表: {batch_path}")
+
+        def worker():
+            try:
+                settings = ensure_app_settings(APP_SETTINGS_PATH)
+                invoice_workbook = find_invoice_workbook(settings)
+                if not invoice_workbook:
+                    raise RuntimeError(
+                        "未找到公司系统出运统计发票号清单，请把主台账放到："
+                        f"{DEFAULT_COMPANY_LEDGER}"
+                    )
+                if self.tax_processor:
+                    tax_processor = self.tax_processor
+                else:
+                    invoice_records = load_invoice_records(str(invoice_workbook))
+                    tax_processor = TaxRefundProcessor(output, ledger_records=invoice_records)
+
+                processor = FinanceBatchProcessor(
+                    output_dir=output,
+                    company_ledger_path=str(invoice_workbook),
+                    tax_processor=tax_processor,
+                    settings=settings,
+                    log_callback=self._enqueue_log,
+                )
+                summary = processor.process_batch(batch_path)
+                self._log_queue.put(("finance_batch_done", summary))
+            except Exception as exc:
+                self._log_queue.put(("finance_batch_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start(self):
+        if Observer is None:
+            messagebox.showerror("缺少依赖", "请先安装 watchdog：\npip install watchdog openpyxl")
+            return
+        if openpyxl is None:
+            messagebox.showerror("缺少依赖", "请先安装 openpyxl：\npip install openpyxl")
+            return
+
+        watch = self.watch_dir.get().strip()
+        output = self.output_dir.get().strip()
+
+        if not watch or not os.path.isdir(watch):
+            messagebox.showwarning("提示", "请先选择有效的监控文件夹！")
+            return
+        if not output:
+            messagebox.showwarning("提示", "请先选择输出主文件夹！")
+            return
+
+        watch = normalize_path(watch)
+        output = normalize_path(output)
+        os.makedirs(output, exist_ok=True)
+
+        if paths_equal(watch, output):
+            messagebox.showwarning("提示", "监控文件夹和输出文件夹不能相同！")
+            return
+        if is_path_inside(output, watch):
+            messagebox.showwarning("提示", "输出文件夹不能放在监控文件夹里面！")
+            return
+
+        settings = ensure_app_settings(APP_SETTINGS_PATH)
+        invoice_workbook = find_invoice_workbook(settings)
+        if not invoice_workbook:
+            messagebox.showwarning(
+                "提示",
+                "未找到公司系统出运统计发票号清单。\n"
+                f"请把主台账放到：\n{DEFAULT_COMPANY_LEDGER}",
+            )
+            return
+        try:
+            invoice_records = load_invoice_records(str(invoice_workbook))
+            invoice_numbers = sorted(invoice_records.keys(), key=len, reverse=True)
+        except Exception as exc:
+            messagebox.showerror("发票号清单读取失败", str(exc))
+            return
+        if not invoice_numbers:
+            messagebox.showwarning("提示", f"公司系统主台账没有可用发票号：\n{invoice_workbook}")
+            return
+
+        self.is_running = True
+        self._is_stopping = False
+        self._close_after_stop = False
+        self._processed_count = 0
+        self.stats_var.set("已处理文件：0 个")
+        self.pending_set.clear()
+        self.watch_dir.set(watch)
+        self.output_dir.set(output)
+
+        # 创建线程池（支持1000+并发文件）
+        self.executor = ThreadPoolExecutor(max_workers=64)
+
+        # 创建 Excel 日志管理器
+        self.excel_logger = ExcelLogger(output)
+        self.invoice_matcher = InvoiceMatcher(invoice_numbers)
+        try:
+            self.tax_processor = TaxRefundProcessor(output, ledger_records=invoice_records)
+        except Exception as exc:
+            messagebox.showerror("退税材料配置读取失败", str(exc))
+            self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor = None
+            self.is_running = False
+            return
+        self.ledger_sync_manager = CompanyLedgerSyncManager(
+            str(invoice_workbook),
+            batch_name=settings.get("finance_batch", {}).get("last_batch_name", ""),
+            log_callback=self._enqueue_log,
+            debounce_seconds=5.0,
+        )
+
+        # 创建文件监控
+        handler = FileHandler(
+            output_dir=output,
+            excel_logger=self.excel_logger,
+            invoice_matcher=self.invoice_matcher,
+            executor=self.executor,
+            log_callback=self._enqueue_log,
+            pending_set=self.pending_set,
+            tax_processor=self.tax_processor,
+            declaration_prompt_callback=self._request_declaration_no,
+            company_ledger_path=str(invoice_workbook),
+            finance_batch_name=settings.get("finance_batch", {}).get("last_batch_name", ""),
+            ledger_sync_manager=self.ledger_sync_manager,
+        )
+
+        self.observer = Observer()
+        self.observer.schedule(handler, watch, recursive=True)
+        self.observer.start()
+        existing_count = self._scan_existing_files(watch, handler)
+
+        self._enqueue_log(f"🚀 开始监控: {watch}")
+        self._enqueue_log(f"📂 输出目录: {output}")
+        self._enqueue_log(f"📒 发票号清单: {invoice_workbook}（{len(invoice_numbers)} 个发票号）")
+        self._enqueue_log(f"📋 退税材料规则: {DEFAULT_MATERIAL_CONFIG}")
+        self._enqueue_log(f"🔁 已启用递归监听；启动时已提交 {existing_count} 个已有文件")
+        self._enqueue_log("─" * 60)
+
+        self.executor.submit(
+            self.tax_processor.process_all_invoice_folders,
+            invoice_numbers,
+            self._request_declaration_no,
+            self._enqueue_log,
+        )
+
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.status_var.set("🟢 监控中…")
+
+    def _scan_existing_files(self, watch: str, handler: FileHandler) -> int:
+        submitted = 0
+        for root, _, files in os.walk(watch):
+            for filename in files:
+                filepath = os.path.join(root, filename)
+                if handler._schedule(filepath):
+                    submitted += 1
+        return submitted
+
+    def _stop(self):
+        if self._is_stopping:
+            return
+        if not self.observer and not self.executor:
+            return
+
+        self._is_stopping = True
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="disabled")
+        self.status_var.set("🟡 正在停止…")
+        self._enqueue_log("─" * 60)
+        self._enqueue_log("⏳ 正在停止监控，等待已提交文件处理完成…")
+
+        observer = self.observer
+        executor = self.executor
+        excel_logger = self.excel_logger
+        ledger_sync_manager = self.ledger_sync_manager
+        self.observer = None
+        self.executor = None
+        self.excel_logger = None
+
+        def shutdown_worker():
+            errors = []
+            try:
+                if observer:
+                    observer.stop()
+                    observer.join(timeout=5)
+            except Exception as exc:
+                errors.append(f"停止文件监听失败: {exc}")
+
+            try:
+                if executor:
+                    executor.shutdown(wait=True, cancel_futures=False)
+            except Exception as exc:
+                errors.append(f"等待处理线程结束失败: {exc}")
+
+            try:
+                if excel_logger:
+                    excel_logger.save()
+            except Exception as exc:
+                errors.append(f"保存工作日志失败: {exc}")
+
+            try:
+                if ledger_sync_manager:
+                    ledger_sync_manager.close(flush=True)
+            except Exception as exc:
+                errors.append(f"同步公司主台账失败: {exc}")
+
+            self._log_queue.put(("stop_done", errors))
+
+        threading.Thread(target=shutdown_worker, daemon=True).start()
+
+    def _finish_stop(self, errors: list[str]):
+        self.is_running = False
+        self._is_stopping = False
+        self.pending_set.clear()
+        self.invoice_matcher = None
+        self.tax_processor = None
+        self.ledger_sync_manager = None
+
+        for err in errors:
+            self._write_log_line(f"❌ {err}")
+        self._write_log_line(f"⏹ 已停止监控。本次共处理 {self._processed_count} 个文件。")
+        self.btn_start.config(state="normal")
+        self.btn_stop.config(state="disabled")
+        self.status_var.set("⚫ 已停止")
+
+        if self._close_after_stop:
+            self.destroy()
+
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
+
+    def _enqueue_log(self, msg: str, processed: bool = False):
+        self._log_queue.put(("log", msg, processed))
+
+    def _request_declaration_no(self, invoice_no: str) -> str:
+        event = threading.Event()
+        payload = {
+            "invoice_no": invoice_no,
+            "value": "",
+            "event": event,
+        }
+        self._log_queue.put(("prompt_declaration", payload))
+        event.wait(DEFAULT_DECLARATION_TIMEOUT_SECONDS)
+        return payload.get("value", "").strip()
+
+    def _finish_finance_batch(self, summary: dict):
+        self._finance_batch_running = False
+        self.btn_finance_batch.config(state="normal")
+        counts = summary.get("counts", {})
+        message = (
+            f"批次总数：{summary.get('total', 0)}\n"
+            f"齐了：{counts.get('齐了', 0)}\n"
+            f"缺材料：{counts.get('缺材料', 0)}\n"
+            f"待复核：{counts.get('待复核', 0)}\n"
+            f"未找到文件夹：{counts.get('未找到文件夹', 0)}\n"
+            f"不在主台账：{counts.get('不在主台账', 0)}\n"
+            f"批次输出目录：\n{summary.get('batch_output_dir', '')}"
+        )
+        messagebox.showinfo("财务批次处理完成", message)
+
+    def _finish_finance_batch_error(self, error: str):
+        self._finance_batch_running = False
+        self.btn_finance_batch.config(state="normal")
+        self._write_log_line(f"❌ 财务批次处理失败: {error}")
+        messagebox.showerror("财务批次处理失败", error)
+
+    def _write_log_line(self, msg: str):
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+    def _poll_log_queue(self):
+        """每100ms从队列中取出日志并写入文本框"""
+        try:
+            while True:
+                item = self._log_queue.get_nowait()
+                if isinstance(item, tuple) and item and item[0] == "stop_done":
+                    self._finish_stop(item[1])
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "finance_batch_done":
+                    self._finish_finance_batch(item[1])
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "finance_batch_error":
+                    self._finish_finance_batch_error(item[1])
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "prompt_declaration":
+                    payload = item[1]
+                    invoice_no = payload.get("invoice_no", "")
+                    value = simpledialog.askstring(
+                        "输入报关号",
+                        f"未能自动识别 {invoice_no} 的报关号。\n请输入报关号：",
+                        parent=self,
+                    )
+                    payload["value"] = (value or "").strip()
+                    payload["event"].set()
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "log":
+                    _, msg, processed = item
+                else:
+                    msg = str(item)
+                    processed = False
+
+                if processed:
+                    self._processed_count += 1
+                    self.stats_var.set(f"已处理文件：{self._processed_count} 个")
+                self._write_log_line(msg)
+        except queue.Empty:
+            pass
+        try:
+            if self.winfo_exists():
+                self.after(100, self._poll_log_queue)
+        except tk.TclError:
+            pass
+
+    def on_closing(self):
+        if self._is_stopping:
+            self._close_after_stop = True
+            self.status_var.set("🟡 正在停止，完成后关闭…")
+        elif self.is_running:
+            if messagebox.askyesno("确认退出", "监控正在运行，确定要退出吗？"):
+                self._close_after_stop = True
+                self._stop()
+        else:
+            self.destroy()
+
+
+# ─────────────────────────────────────────────
+# 依赖检查与安装提示
+# ─────────────────────────────────────────────
+
+def check_and_install_deps():
+    checks = [
+        ("watchdog", "watchdog"),
+        ("openpyxl", "openpyxl"),
+        ("fitz", "PyMuPDF"),
+        ("rapidocr_onnxruntime", "rapidocr-onnxruntime"),
+    ]
+    missing = []
+    for module_name, package_name in checks:
+        try:
+            __import__(module_name)
+        except ImportError:
+            missing.append(package_name)
+
+    if missing:
+        import subprocess
+        print(f"检测到缺少依赖: {', '.join(missing)}")
+        print("正在自动安装……")
+        for pkg in missing:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "-q"])
+        print("依赖安装完成，请重新运行程序。")
+        sys.exit(0)
+
+
+# ─────────────────────────────────────────────
+# 入口
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    check_and_install_deps()
+
+    # 重新导入（安装后）
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    app = App()
+    app.protocol("WM_DELETE_WINDOW", app.on_closing)
+    app.mainloop()
