@@ -1296,6 +1296,12 @@ class TaxRefundProcessor:
                     merge_folder_contents(original, digits_folder)
                 return digits_folder
 
+        prefixed_folder = self._find_prefixed_invoice_folder(invoice_no)
+        if prefixed_folder:
+            if os.path.isdir(original) and not paths_equal(original, prefixed_folder):
+                merge_folder_contents(original, prefixed_folder)
+            return prefixed_folder
+
         if os.path.isdir(original):
             return original
 
@@ -1307,6 +1313,28 @@ class TaxRefundProcessor:
             if entry.is_dir() and suffix_pattern.search(entry.name):
                 return entry.path
         return original
+
+    def _find_prefixed_invoice_folder(self, invoice_no: str) -> str:
+        prefix = sanitize_folder_name(invoice_no)
+        if not prefix or not os.path.isdir(self.output_dir):
+            return ""
+
+        pattern = re.compile(r"^" + re.escape(prefix) + r"(?!\d)", re.IGNORECASE)
+        matches = []
+        for entry in os.scandir(self.output_dir):
+            if entry.is_dir() and pattern.match(entry.name):
+                matches.append(entry.path)
+        if not matches:
+            return ""
+
+        prefix_key = prefix.casefold()
+
+        def sort_key(path: str):
+            name = os.path.basename(os.path.normpath(path))
+            name_key = name.casefold()
+            return (name_key == prefix_key, len(name), name_key)
+
+        return sorted(matches, key=sort_key)[0]
 
     def invoice_display(self, invoice_no: str) -> str:
         mode = self.config.get("folder_name", {}).get("invoice_display", "digits_only")

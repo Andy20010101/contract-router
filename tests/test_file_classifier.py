@@ -108,6 +108,26 @@ def test_resolve_target_folder_prefers_digits_folder_and_merges_full_invoice_fol
     assert (digits_folder / "外销_重复1.pdf").read_text(encoding="utf-8") == "from full invoice folder"
 
 
+def test_resolve_target_folder_uses_existing_ly_prefixed_child_folder(tmp_path):
+    output_dir = tmp_path / "output"
+    prefixed_folder = output_dir / "LY25112915 上海客户"
+    exact_folder = output_dir / "LY25112915"
+    prefixed_folder.mkdir(parents=True)
+    exact_folder.mkdir()
+    (prefixed_folder / "外销.pdf").write_text("existing", encoding="utf-8")
+    (exact_folder / "提单.pdf").write_text("bill", encoding="utf-8")
+    (exact_folder / "外销.pdf").write_text("from exact folder", encoding="utf-8")
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    target = processor.resolve_target_folder("LY25112915")
+
+    assert Path(target) == prefixed_folder
+    assert not exact_folder.exists()
+    assert (prefixed_folder / "提单.pdf").read_text(encoding="utf-8") == "bill"
+    assert (prefixed_folder / "外销.pdf").read_text(encoding="utf-8") == "existing"
+    assert (prefixed_folder / "外销_重复1.pdf").read_text(encoding="utf-8") == "from exact folder"
+
+
 def test_move_file_to_output_uses_existing_digits_folder(tmp_path):
     source = tmp_path / "LY25112915 提单.pdf"
     source.write_bytes(b"data")
@@ -129,6 +149,30 @@ def test_move_file_to_output_uses_existing_digits_folder(tmp_path):
     assert subfolder == "25112915"
     assert "25112915/" in message
     assert Path(dest_path).parent == digits_folder
+    assert not (output_dir / "LY25112915").exists()
+
+
+def test_move_file_to_output_uses_existing_ly_prefixed_child_folder(tmp_path):
+    source = tmp_path / "LY25112915 提单.pdf"
+    source.write_bytes(b"data")
+    output_dir = tmp_path / "output"
+    prefixed_folder = output_dir / "LY25112915 上海客户"
+    prefixed_folder.mkdir(parents=True)
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    success, subfolder, message, dest_path, invoice_no, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        invoice_dir_resolver=processor.resolve_target_folder,
+    )
+
+    assert success is True
+    assert status == "成功"
+    assert invoice_no == "LY25112915"
+    assert subfolder == "LY25112915 上海客户"
+    assert "LY25112915 上海客户/" in message
+    assert Path(dest_path) == prefixed_folder / "LY25112915 提单.pdf"
     assert not (output_dir / "LY25112915").exists()
 
 
