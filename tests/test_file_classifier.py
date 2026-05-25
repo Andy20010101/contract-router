@@ -314,6 +314,54 @@ def test_end_to_end_incoming_random_files_move_classify_and_close_loop(monkeypat
     assert "采购合同" not in record["缺少材料"]
 
 
+def test_purchase_contract_filename_declaration_number_is_fallback(monkeypatch, tmp_path):
+    texts = complete_material_texts()
+    texts["scan001.pdf"] = (
+        "报关委托书\n"
+        "代理报关委托\n"
+        "一般贸易\n"
+        "177FCWCWS64050\n"
+        "7"
+    )
+    folder = tmp_path / "output" / "LY25117260 工厂"
+    folder.mkdir(parents=True)
+    for filename in texts:
+        (folder / filename).write_bytes(b"dummy")
+    contract = folder / "123456789012345 25117260 采购合同 优尚.jpg"
+    contract.write_bytes(b"contract")
+
+    monkeypatch.setattr(fc, "pdf_text", lambda filepath, max_pages=2: texts.get(Path(filepath).name, ""))
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: texts.get(Path(filepath).name, ""))
+
+    processor = fc.TaxRefundProcessor(
+        str(tmp_path / "output"),
+        config_path=tmp_path / "materials_config.json",
+        ledger_records={
+            "LY25117260": {
+                "发票号": "LY25117260",
+                "金额": 100,
+                "目的国": "波兰",
+                "出运日期": "2026-05-20",
+            }
+        },
+    )
+
+    record = processor.evaluate_invoice(
+        "LY25117260",
+        str(folder),
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+    )
+
+    assert record["报关号"] == "123456789012345"
+    assert record["状态"] == "可改名"
+    assert record["闭环状态"] == "强闭环通过"
+    assert record["缺少材料"] == ""
+    assert record["需人工确认文件"] == ""
+    assert record["闭环冲突"] == ""
+
+
 def test_text_normalization_joins_wrapped_identifiers_and_keeps_packing_bl_out_of_ocean_bl():
     assert fc.keyword_match("电子发票", "电⼦发票")
 

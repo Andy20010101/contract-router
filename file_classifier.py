@@ -1778,6 +1778,7 @@ class TaxRefundProcessor:
         unrecognized = []
         manual_review = []
         declaration_text = ""
+        purchase_contract_declaration_text = ""
 
         for item in classifications:
             if item["status"] == "manual_review":
@@ -1788,6 +1789,8 @@ class TaxRefundProcessor:
                 continue
             if item["material_id"] == "customs_power_of_attorney" and item.get("text"):
                 declaration_text += "\n" + item["text"]
+            if item["material_id"] == "purchase_contract":
+                purchase_contract_declaration_text += "\n" + item["filename"]
             if not item["required"]:
                 continue
             name = item["material_name"]
@@ -1801,6 +1804,7 @@ class TaxRefundProcessor:
             declaration_override
             or self.declarations.get(invoice_no, "")
             or extract_declaration_number(declaration_text)
+            or extract_declaration_number(purchase_contract_declaration_text)
         )
         if declaration_no:
             declaration_no = sanitize_folder_name(declaration_no)
