@@ -83,9 +83,296 @@ def test_invoice_matcher_purchase_contract_fallback():
     matcher = fc.InvoiceMatcher(["LY25112915"])
 
     assert matcher.match("LY25112915 采购合同俊源.jpg") == "LY25112915"
-    assert matcher.match("LY99999999 采购合同俊源.jpg") == "LY99999999"
+    assert matcher.match("LY99999999 采购合同俊源.jpg") == ""
     assert matcher.match("LY99999999 运费发票.jpg") == ""
     assert matcher.match("采购合同俊源 LY99999999.jpg") == ""
+
+
+def test_invoice_matcher_purchase_contract_matches_unique_ledger_digits():
+    matcher = fc.InvoiceMatcher(["LY25117260", "LY25117261"])
+
+    assert matcher.match("采购合同 优尚 25117260.jpg") == "LY25117260"
+    assert matcher.match("合同-优尚-25117260.jpg") == "LY25117260"
+    assert matcher.match("采购合同 25117261 莱尔特.jpg") == "LY25117261"
+    assert matcher.match("25117260 采购合同 优尚.jpg") == "LY25117260"
+    assert matcher.match("采购合同 99999999.jpg") == ""
+    assert matcher.match("采购合同 25117260 25117261.jpg") == ""
+
+
+def test_invoice_matcher_pairs_unique_digit_prefix_to_full_invoice():
+    matcher = fc.InvoiceMatcher(["LY25112915", "LY25112916"])
+
+    assert matcher.match("25112915 提单.pdf") == "LY25112915"
+    assert matcher.match("251129150 提单.pdf") == ""
+    assert fc.strip_invoice_prefix("25112915 提单.pdf", "LY25112915") == "提单.pdf"
+
+
+def test_invoice_matcher_does_not_pair_ambiguous_digit_prefix():
+    matcher = fc.InvoiceMatcher(["LY25112915", "AB25112915"])
+
+    assert matcher.match("25112915 提单.pdf") == ""
+    assert matcher.match("LY25112915 提单.pdf") == "LY25112915"
+
+
+def test_bill_of_lading_matches_scanned_ocr_text_without_filename_keyword(monkeypatch, tmp_path):
+    image = tmp_path / "25112915.jpg"
+    image.write_bytes(b"image")
+
+    monkeypatch.setattr(
+        fc,
+        "ocr_text",
+        lambda filepath: "BILL OF LADING\nSHIPPER\nCONSIGNEE\nABCD1234567\n12 CARTONS",
+    )
+
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+    result = classifier.classify_file(str(image), "LY25112915")
+
+    assert result["status"] == "matched"
+    assert result["material_id"] == "bill_of_lading"
+
+
+def complete_material_texts():
+    return {
+        "random_a.pdf": (
+            "PROFORMA INVOICE\n"
+            "Invoice No. 25117260\n"
+            "JIAXING LAYO\n"
+            "Transport details\n"
+            "Terms of payment\n"
+            "Description of goods\n"
+            "POLAND\n"
+            "USD 100.00"
+        ),
+        "scan001.pdf": (
+            "报关委托书\n"
+            "代理报关委托\n"
+            "报关单编号 123456789012345\n"
+            "一般贸易\n"
+            "177FCWCWS64050\n"
+            "7"
+        ),
+        "20260212.pdf": (
+            "电子发票\n"
+            "发票号码 12345678\n"
+            "国内货物运输代理服务\n"
+            "报关\n"
+            "嘉兴新锴国际货运代理\n"
+            "177FCWCWS640507"
+        ),
+        "docx_export.pdf": (
+            "OCEAN BILL OF LADING\n"
+            "SHIPPER\n"
+            "CONSIGNEE\n"
+            "NOTIFY PARTY\n"
+            "FREIGHT COLLECT\n"
+            "SHIPPED ON BOARD\n"
+            "SHIPPER'S LOAD COUNT\n"
+            "B/L No. ESHGDN2600603\n"
+            "Container MSBU5039559 Seal FX45652534\n"
+            "12 CARTONS\n"
+            "1234.56KGS\n"
+            "MAY 20, 2026"
+        ),
+        "wechat_image.png": (
+            "CONTAINER LOAD PLAN\n"
+            "Container No. MSBU5039559\n"
+            "Seal No. FX45652534\n"
+            "Port of Loading SHANGHAI\n"
+            "Port of Discharge GDANSK\n"
+            "Place of Delivery GDANSK\n"
+            "Packing Date 2026-05-19\n"
+            "Total Packages 12\n"
+            "Total Cargo Wt 1234.56KGS\n"
+            "Total Meas 10\n"
+            "40HC\n"
+            "Bill of Lading No. 177FCWCWS64050\n"
+            "7"
+        ),
+        "invoice_unknown.pdf": (
+            "电⼦发票\n"
+            "发票号码 87654321\n"
+            "国际货运代理费\n"
+            "港口码头费\n"
+            "汇利达欧海国际货运代理\n"
+            "B/L No. ESHGDN2600603"
+        ),
+    }
+
+
+def test_random_filenames_complete_package_is_matched_and_strong_closed_loop(monkeypatch, tmp_path):
+    texts = complete_material_texts()
+    folder = tmp_path / "output" / "LY25117260"
+    folder.mkdir(parents=True)
+    for filename in texts:
+        (folder / filename).write_bytes(b"dummy")
+
+    monkeypatch.setattr(fc, "pdf_text", lambda filepath, max_pages=2: texts.get(Path(filepath).name, ""))
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: texts.get(Path(filepath).name, ""))
+
+    processor = fc.TaxRefundProcessor(
+        str(tmp_path / "output"),
+        config_path=tmp_path / "materials_config.json",
+        ledger_records={
+            "LY25117260": {
+                "发票号": "LY25117260",
+                "金额": 100,
+                "目的国": "波兰",
+                "出运日期": "2026-05-20",
+            }
+        },
+    )
+
+    record = processor.evaluate_invoice(
+        "LY25117260",
+        str(folder),
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+    )
+
+    assert record["状态"] == "可改名"
+    assert record["闭环状态"] == "强闭环通过"
+    assert record["缺少材料"] == ""
+    assert record["需人工确认文件"] == ""
+    assert record["闭环冲突"] == ""
+    for material_name in ["外销", "报关委托书", "报关费发票", "提单", "装箱单", "运费发票"]:
+        assert material_name in record["已识别必需材料"]
+
+
+def test_end_to_end_incoming_random_files_move_classify_and_close_loop(monkeypatch, tmp_path):
+    ledger_path = tmp_path / "4个月.xlsx"
+    save_workbook(
+        ledger_path,
+        {
+            "2月": [
+                ["发票号", "出运日期", "目的国(地区)", "金额"],
+                ["LY25117260", "2026-05-20", "波兰", 100],
+                ["LY25117261", "2026-05-21", "德国", 200],
+            ],
+        },
+    )
+    ledger_records = fc.load_invoice_records(str(ledger_path))
+    matcher = fc.InvoiceMatcher(list(ledger_records.keys()))
+
+    watch_dir = tmp_path / "watch"
+    incoming_invoice_folder = watch_dir / "25117260 raw"
+    incoming_invoice_folder.mkdir(parents=True)
+    output_dir = tmp_path / "output"
+    processor = fc.TaxRefundProcessor(
+        str(output_dir),
+        config_path=tmp_path / "materials_config.json",
+        ledger_records=ledger_records,
+    )
+
+    texts = complete_material_texts()
+    source_files = []
+    for filename in texts:
+        path = incoming_invoice_folder / filename
+        path.write_bytes(b"dummy")
+        source_files.append(path)
+    contract = watch_dir / "合同-优尚-25117260.jpg"
+    contract.write_bytes(b"contract")
+    source_files.append(contract)
+
+    moved_names = []
+    for source in source_files:
+        success, _, _, dest_path, invoice_no, status = fc.move_file_to_output(
+            str(source),
+            str(output_dir),
+            matcher,
+            invoice_dir_resolver=processor.resolve_target_folder,
+            source_root=str(watch_dir),
+        )
+        assert success is True
+        assert status == "成功"
+        assert invoice_no == "LY25117260"
+        moved_names.append(Path(dest_path).name)
+
+    invoice_folder = output_dir / "LY25117260"
+    assert sorted(moved_names) == sorted([*texts.keys(), "合同-优尚-25117260.jpg"])
+    assert not (output_dir / fc.REVIEW_SUBFOLDER).exists()
+
+    monkeypatch.setattr(fc, "pdf_text", lambda filepath, max_pages=2: texts.get(Path(filepath).name, ""))
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: texts.get(Path(filepath).name, ""))
+
+    record = processor.evaluate_invoice(
+        "LY25117260",
+        str(invoice_folder),
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+    )
+
+    assert ledger_records["LY25117260"]["目的国"] == "波兰"
+    assert record["状态"] == "可改名"
+    assert record["闭环状态"] == "强闭环通过"
+    assert record["报关号"] == "123456789012345"
+    assert record["缺少材料"] == ""
+    assert record["未识别文件"] == ""
+    assert record["需人工确认文件"] == ""
+    assert record["闭环冲突"] == ""
+    assert "采购合同" not in record["缺少材料"]
+
+
+def test_text_normalization_joins_wrapped_identifiers_and_keeps_packing_bl_out_of_ocean_bl():
+    assert fc.keyword_match("电子发票", "电⼦发票")
+
+    fields = fc.extract_document_fields(
+        "packing_list",
+        "CONTAINER LOAD PLAN\nBill of Lading No. 177FCWCWS64050\n7",
+        "random.png",
+    )
+
+    assert "177FCWCWS640507" in fields["booking_refs"]
+    assert fields["bl_numbers"] == []
+
+
+def test_closed_loop_field_correspondence_and_ledger_missing_unverified():
+    texts = complete_material_texts()
+
+    def matched_doc(material_id, filename):
+        return {
+            "status": "matched",
+            "material_id": material_id,
+            "fields": fc.extract_document_fields(material_id, texts[filename], filename),
+        }
+
+    classifications = [
+        matched_doc("export_sales", "random_a.pdf"),
+        matched_doc("customs_power_of_attorney", "scan001.pdf"),
+        matched_doc("customs_fee_invoice", "20260212.pdf"),
+        matched_doc("bill_of_lading", "docx_export.pdf"),
+        matched_doc("packing_list", "wechat_image.png"),
+        matched_doc("freight_invoice", "invoice_unknown.pdf"),
+    ]
+
+    packing_fields = classifications[4]["fields"]
+    assert "177FCWCWS640507" in packing_fields["booking_refs"]
+    assert packing_fields["bl_numbers"] == []
+
+    closed_loop = fc.evaluate_closed_loop(
+        "LY25117260",
+        {"发票号": "LY25117260", "金额": 100, "目的国": "波兰", "出运日期": "2026-05-20"},
+        classifications,
+        "123456789012345",
+    )
+
+    assert closed_loop["status"] == "strong_pass"
+    assert closed_loop["conflicts"] == []
+    assert any("提单号连接提单与运费发票" in item for item in closed_loop["evidence"])
+    assert any("箱号连接提单与装箱单" in item for item in closed_loop["evidence"])
+    assert any("封号连接提单与装箱单" in item for item in closed_loop["evidence"])
+
+    no_ledger_loop = fc.evaluate_closed_loop(
+        "LY25117260",
+        {},
+        classifications,
+        "123456789012345",
+    )
+
+    assert no_ledger_loop["status"] == "strong_pass"
+    assert no_ledger_loop["conflicts"] == []
+    assert "台账金额未核验" in no_ledger_loop["unverified"]
 
 
 def test_resolve_target_folder_prefers_digits_folder_and_merges_full_invoice_folder(tmp_path):
@@ -174,6 +461,57 @@ def test_move_file_to_output_uses_existing_ly_prefixed_child_folder(tmp_path):
     assert "LY25112915 上海客户/" in message
     assert Path(dest_path) == prefixed_folder / "LY25112915 提单.pdf"
     assert not (output_dir / "LY25112915").exists()
+
+
+def test_move_file_to_output_matches_invoice_parent_folder_for_generic_material(tmp_path):
+    watch_dir = tmp_path / "watch"
+    source = watch_dir / "25112915" / "装箱单.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"data")
+    output_dir = tmp_path / "output"
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    success, subfolder, message, dest_path, invoice_no, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        invoice_dir_resolver=processor.resolve_target_folder,
+        source_root=str(watch_dir),
+    )
+
+    assert success is True
+    assert status == "成功"
+    assert invoice_no == "LY25112915"
+    assert subfolder == "LY25112915"
+    assert message == "成功: 装箱单.pdf → LY25112915/"
+    assert Path(dest_path) == output_dir / "LY25112915" / "装箱单.pdf"
+
+
+def test_move_file_to_output_adds_repeat_suffix_for_duplicate_generic_material(tmp_path):
+    watch_dir = tmp_path / "watch"
+    source = watch_dir / "25112915" / "装箱单.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_text("new", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    existing = output_dir / "LY25112915" / "装箱单.pdf"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("old", encoding="utf-8")
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    success, subfolder, message, dest_path, invoice_no, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        invoice_dir_resolver=processor.resolve_target_folder,
+        source_root=str(watch_dir),
+    )
+
+    assert success is True
+    assert status == "成功"
+    assert invoice_no == "LY25112915"
+    assert Path(dest_path) == output_dir / "LY25112915" / "装箱单_重复1.pdf"
+    assert existing.read_text(encoding="utf-8") == "old"
+    assert Path(dest_path).read_text(encoding="utf-8") == "new"
 
 
 def test_load_finance_batch_invoices_reads_headers_first_column_multisheet_and_dedup(tmp_path):

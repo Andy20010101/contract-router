@@ -13,6 +13,8 @@
   pip install watchdog openpyxl PyMuPDF rapidocr-onnxruntime
 """
 
+from __future__ import annotations
+
 import os
 import re
 import sys
@@ -23,6 +25,7 @@ import threading
 import queue
 import json
 import tempfile
+import unicodedata
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -204,16 +207,65 @@ def merge_folder_contents(source_dir: str, target_dir: str) -> None:
     os.rmdir(source_dir)
 
 
+def normalize_unicode_text(value: str) -> str:
+    return unicodedata.normalize("NFKC", str(value or ""))
+
+
+def join_wrapped_identifiers(text: str) -> str:
+    text = normalize_unicode_text(text)
+    pattern = re.compile(
+        r"\b([A-Za-z0-9]{6,})[ \t]*[\r\n]+[ \t]*"
+        r"([A-Za-z0-9]{1,4})(?![ \t]*(?:%|CARTONS|CTNS|PACKAGES|KGS|PCS|PALLETS)\b)(?=\b)"
+    )
+    label_fragments = {
+        "SEAL", "PORT", "DATE", "TOTAL", "CARGO", "MEAS", "PACK", "NO", "NOS",
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "SEPT",
+        "OCT", "NOV", "DEC",
+    }
+
+    def join_or_space(match: re.Match) -> str:
+        left, right = match.group(1), match.group(2)
+        left_upper = left.upper()
+        right_upper = right.upper()
+        if right_upper in label_fragments:
+            return f"{left} {right}"
+        if left_upper.endswith(("CARTONS", "CTNS", "PACKAGES", "KGS", "CBM", "PCS", "PALLETS")):
+            return f"{left} {right}"
+        if re.fullmatch(r"\d{2}H[QC]", right_upper):
+            return f"{left} {right}"
+        if re.search(r"\d", left) and (right.isdigit() or right.isupper()):
+            return f"{left}{right}"
+        return f"{left} {right}"
+
+    previous = None
+    while previous != text:
+        previous = text
+        text = pattern.sub(join_or_space, text)
+    return text
+
+
+def normalize_document_text(value: str) -> str:
+    text = join_wrapped_identifiers(value)
+    text = text.replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def normalize_text_for_match(value: str) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    return normalize_document_text(value).casefold()
 
 
 def strip_invoice_prefix(filename: str, invoice_no: str) -> str:
     stem = Path(filename).stem
     suffix = Path(filename).suffix
-    if invoice_no and stem.casefold().startswith(invoice_no.casefold()):
-        stem = stem[len(invoice_no):]
-        stem = re.sub(r"^[\s_\-—–+]+", "", stem)
+    prefixes = [invoice_no]
+    digits = invoice_digits(invoice_no)
+    if digits and digits != invoice_no:
+        prefixes.append(digits)
+    for prefix in prefixes:
+        if prefix and re.match(re.escape(prefix) + r"(?![A-Za-z0-9])", stem, re.IGNORECASE):
+            stem = stem[len(prefix):]
+            stem = re.sub(r"^[\s_\-—–+]+", "", stem)
+            break
     return f"{stem}{suffix}" if stem else filename
 
 
@@ -456,22 +508,77 @@ def load_invoice_records(workbook_path: str) -> dict[str, dict]:
 
 class InvoiceMatcher:
     def __init__(self, invoice_numbers: list[str]):
-        self._entries = [
-            (str(invoice_no).strip().casefold(), str(invoice_no).strip().upper())
-            for invoice_no in sorted(invoice_numbers, key=len, reverse=True)
+        normalized = [
+            str(invoice_no).strip()
+            for invoice_no in invoice_numbers
             if str(invoice_no).strip()
         ]
+        digit_counts = {}
+        for invoice_no in normalized:
+            digits = invoice_digits(invoice_no)
+            if digits:
+                digit_counts[digits] = digit_counts.get(digits, 0) + 1
+
+        entries = []
+        seen = set()
+        for invoice_no in sorted(normalized, key=len, reverse=True):
+            canonical = invoice_no.upper()
+            for alias in (invoice_no, invoice_digits(invoice_no)):
+                if not alias or (alias != invoice_no and digit_counts.get(alias) != 1):
+                    continue
+                key = alias.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append((key, canonical))
+        self._entries = entries
+        self._invoice_numbers = [invoice_no.upper() for invoice_no in normalized]
 
     def match(self, filename: str) -> str:
         raw_name = Path(filename).name.strip()
-        name = raw_name.casefold()
+        normalized_name = normalize_unicode_text(raw_name)
+        if "采购合同" in normalized_name or "合同" in normalized_name:
+            return self._match_purchase_contract(normalized_name)
+
+        name = normalized_name.casefold()
         for key, invoice_no in self._entries:
-            if name.startswith(key):
+            if re.match(re.escape(key) + r"(?![A-Za-z0-9])", name, re.IGNORECASE):
                 return invoice_no
-        if ("采购合同" in raw_name or "合同" in raw_name):
-            match = re.match(r"^\s*(LY\d{8,12})(?!\d)", raw_name, re.IGNORECASE)
-            if match:
-                return match.group(1).upper()
+        return ""
+
+    def _match_purchase_contract(self, filename: str) -> str:
+        digit_groups = re.findall(r"\d{6,12}", filename)
+        if not digit_groups:
+            return ""
+
+        matches = {
+            invoice_no
+            for invoice_no in self._invoice_numbers
+            for digits in digit_groups
+            if invoice_equivalent(digits, invoice_no)
+        }
+        if len(matches) == 1:
+            return next(iter(matches))
+        return ""
+
+    def match_path(self, filepath: str, source_root: str = "") -> str:
+        invoice_no = self.match(Path(filepath).name)
+        if invoice_no:
+            return invoice_no
+
+        path = Path(normalize_path(filepath))
+        if source_root:
+            try:
+                relative_path = path.relative_to(Path(normalize_path(source_root)))
+            except ValueError:
+                relative_path = path
+        else:
+            relative_path = path
+
+        for folder_name in reversed(relative_path.parts[:-1]):
+            invoice_no = self.match(folder_name)
+            if invoice_no:
+                return invoice_no
         return ""
 
 
@@ -561,13 +668,14 @@ def move_file_to_output(
     output_dir: str,
     invoice_matcher: InvoiceMatcher,
     invoice_dir_resolver=None,
+    source_root: str = "",
 ) -> tuple:
     """
     将文件剪切到输出目录的发票号子文件夹。
     返回 (success, subfolder, message, dest_path, invoice_no, status)
     """
     filename = os.path.basename(src_path)
-    invoice_no = invoice_matcher.match(filename)
+    invoice_no = invoice_matcher.match_path(src_path, source_root=source_root)
     matched = bool(invoice_no)
     subfolder_name = sanitize_folder_name(invoice_no if matched else REVIEW_SUBFOLDER)
     dest_dir = (
@@ -581,12 +689,8 @@ def move_file_to_output(
         os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, filename)
 
-        # 如果目标已存在，在文件名后加时间戳避免覆盖
         if os.path.exists(dest_path):
-            stem = Path(filename).stem
-            suffix = Path(filename).suffix
-            timestamp = int(time.time() * 1000)
-            dest_path = os.path.join(dest_dir, f"{stem}_{timestamp}{suffix}")
+            dest_path = unique_path(dest_path)
 
         shutil.move(src_path, dest_path)
         if matched:
@@ -635,6 +739,12 @@ def default_material_config() -> dict:
                 },
                 "ocr_text_rules": {
                     "all": ["PROFORMA INVOICE"],
+                    "any": [
+                        "JIAXING LAYO",
+                        "Transport details",
+                        "Terms of payment",
+                        "Description of goods",
+                    ],
                 },
                 "negative_patterns": ["电子发票", "发票号码"],
             },
@@ -650,6 +760,7 @@ def default_material_config() -> dict:
                 },
                 "ocr_text_rules": {
                     "any": ["报关委托书", "代理报关委托", "报关单编号", "一般贸易"],
+                    "regex_any": [r"\b\d{15,24}\b", r"\b\d{10}\b"],
                 },
             },
             {
@@ -661,6 +772,12 @@ def default_material_config() -> dict:
                 "pdf_text_rules": {
                     "all": ["电子发票", "发票号码"],
                     "any": ["国内货物运输代理服务", "报关", "嘉兴新锴国际货运代理"],
+                    "regex_any": [r"\b\d{2,}[A-Z]{2,}[A-Z0-9]{5,}\b"],
+                },
+                "ocr_text_rules": {
+                    "all": ["电子发票", "发票号码"],
+                    "any": ["国内货物运输代理服务", "报关", "嘉兴新锴国际货运代理"],
+                    "regex_any": [r"\b\d{2,}[A-Z]{2,}[A-Z0-9]{5,}\b"],
                 },
                 "negative_patterns": ["国际货运代理费", "港口码头费"],
             },
@@ -669,9 +786,26 @@ def default_material_config() -> dict:
                 "name": "提单",
                 "required": True,
                 "final_name": "提单",
-                "file_name_patterns": ["提单", "bill of lading", "b/l"],
+                "file_name_patterns": ["提单", "海运提单", "bill of lading", "b/l"],
                 "pdf_text_rules": {
                     "any": [
+                        "BILL OF LADING",
+                        "OCEAN BILL OF LADING",
+                        "SEA WAYBILL",
+                        "SHIPPER",
+                        "CONSIGNEE",
+                        "NOTIFY PARTY",
+                        "FREIGHT COLLECT",
+                        "SHIPPED ON BOARD",
+                        "SHIPPER'S LOAD COUNT",
+                    ],
+                    "regex_any": [r"[A-Z]{4}\d{7}", r"\d+\s*CARTONS", r"\d+\.\d+KGS"],
+                },
+                "ocr_text_rules": {
+                    "any": [
+                        "BILL OF LADING",
+                        "OCEAN BILL OF LADING",
+                        "SEA WAYBILL",
                         "SHIPPER",
                         "CONSIGNEE",
                         "NOTIFY PARTY",
@@ -688,8 +822,55 @@ def default_material_config() -> dict:
                 "required": True,
                 "final_name": "装箱单",
                 "file_name_patterns": ["装箱单", "箱单", "packing list"],
+                "pdf_text_rules": {
+                    "any": [
+                        "PACKING LIST",
+                        "装箱单",
+                        "CONTAINER LOAD PLAN",
+                        "Container No.",
+                        "Seal No.",
+                        "Port of Loading",
+                        "Port of Discharge",
+                        "Place of Delivery",
+                        "Packing Date",
+                        "Total Packages",
+                        "Total Cargo Wt",
+                        "Total Meas",
+                        "CARTONS",
+                        "G.W.",
+                        "N.W.",
+                        "MEAS",
+                        "SHANGHAI",
+                        "GDANSK",
+                        "40HC",
+                        "40HQ",
+                    ],
+                    "regex_any": [r"\b[A-Z]{4}\d{7}\b", r"\b[A-Z]{1,4}\d{5,10}\b", r"\b40H[QC]\b"],
+                },
                 "ocr_text_rules": {
-                    "any": ["PACKING LIST", "装箱单", "CARTONS", "G.W.", "N.W.", "MEAS"],
+                    "any": [
+                        "PACKING LIST",
+                        "装箱单",
+                        "CONTAINER LOAD PLAN",
+                        "Container No.",
+                        "Seal No.",
+                        "Port of Loading",
+                        "Port of Discharge",
+                        "Place of Delivery",
+                        "Packing Date",
+                        "Total Packages",
+                        "Total Cargo Wt",
+                        "Total Meas",
+                        "CARTONS",
+                        "G.W.",
+                        "N.W.",
+                        "MEAS",
+                        "SHANGHAI",
+                        "GDANSK",
+                        "40HC",
+                        "40HQ",
+                    ],
+                    "regex_any": [r"\b[A-Z]{4}\d{7}\b", r"\b[A-Z]{1,4}\d{5,10}\b", r"\b40H[QC]\b"],
                 },
             },
             {
@@ -701,6 +882,12 @@ def default_material_config() -> dict:
                 "pdf_text_rules": {
                     "all": ["电子发票", "发票号码"],
                     "any": ["国际货运代理费", "港口码头费", "汇利达欧海国际货运代理"],
+                    "regex_any": [r"\b[A-Z]{5,8}\d{6,12}\b"],
+                },
+                "ocr_text_rules": {
+                    "all": ["电子发票", "发票号码"],
+                    "any": ["国际货运代理费", "港口码头费", "汇利达欧海国际货运代理"],
+                    "regex_any": [r"\b[A-Z]{5,8}\d{6,12}\b"],
                 },
                 "negative_patterns": ["国内货物运输代理服务", "报关费"],
             },
@@ -727,13 +914,136 @@ def ensure_material_config(path: Path = DEFAULT_MATERIAL_CONFIG) -> dict:
         data = json.load(f)
 
     changed = False
+
+    def add_values(target: list, values: list[str]) -> bool:
+        local_changed = False
+        for value in values:
+            if value not in target:
+                target.append(value)
+                local_changed = True
+        return local_changed
+
+    def ensure_rules(material: dict, rules_key: str, any_values: list[str] = None,
+                     regex_values: list[str] = None, all_values: list[str] = None) -> bool:
+        rules = material.setdefault(rules_key, {})
+        local_changed = False
+        if all_values:
+            local_changed = add_values(rules.setdefault("all", []), all_values) or local_changed
+        if any_values:
+            local_changed = add_values(rules.setdefault("any", []), any_values) or local_changed
+        if regex_values:
+            local_changed = add_values(rules.setdefault("regex_any", []), regex_values) or local_changed
+        return local_changed
+
+    export_sales_any = [
+        "JIAXING LAYO",
+        "Transport details",
+        "Terms of payment",
+        "Description of goods",
+    ]
+    customs_any = ["报关委托书", "代理报关委托", "报关单编号", "一般贸易"]
+    customs_regex = [r"\b\d{15,24}\b", r"\b\d{10}\b"]
+    customs_fee_any = ["国内货物运输代理服务", "报关", "嘉兴新锴国际货运代理"]
+    customs_fee_regex = [r"\b\d{2,}[A-Z]{2,}[A-Z0-9]{5,}\b"]
+    bill_any = [
+        "BILL OF LADING",
+        "OCEAN BILL OF LADING",
+        "SEA WAYBILL",
+        "SHIPPER",
+        "CONSIGNEE",
+        "NOTIFY PARTY",
+        "FREIGHT COLLECT",
+        "SHIPPED ON BOARD",
+        "SHIPPER'S LOAD COUNT",
+    ]
+    bill_regex = [r"[A-Z]{4}\d{7}", r"\d+\s*CARTONS", r"\d+\.\d+KGS"]
+    packing_any = [
+        "PACKING LIST",
+        "装箱单",
+        "CONTAINER LOAD PLAN",
+        "Container No.",
+        "Seal No.",
+        "Port of Loading",
+        "Port of Discharge",
+        "Place of Delivery",
+        "Packing Date",
+        "Total Packages",
+        "Total Cargo Wt",
+        "Total Meas",
+        "CARTONS",
+        "G.W.",
+        "N.W.",
+        "MEAS",
+        "SHANGHAI",
+        "GDANSK",
+        "40HC",
+        "40HQ",
+    ]
+    packing_regex = [r"\b[A-Z]{4}\d{7}\b", r"\b[A-Z]{1,4}\d{5,10}\b", r"\b40H[QC]\b"]
+    freight_any = ["国际货运代理费", "港口码头费", "汇利达欧海国际货运代理"]
+    freight_regex = [r"\b[A-Z]{5,8}\d{6,12}\b"]
+
     for material in data.get("materials", []):
         if material.get("id") == "purchase_contract":
             patterns = material.setdefault("file_name_patterns", [])
             if "合同" not in patterns:
                 patterns.append("合同")
                 changed = True
-            break
+        if material.get("id") == "export_sales":
+            changed = ensure_rules(
+                material,
+                "ocr_text_rules",
+                any_values=export_sales_any,
+                all_values=["PROFORMA INVOICE"],
+            ) or changed
+        if material.get("id") == "customs_power_of_attorney":
+            for rules_key in ["pdf_text_rules", "ocr_text_rules"]:
+                changed = ensure_rules(
+                    material,
+                    rules_key,
+                    any_values=customs_any,
+                    regex_values=customs_regex,
+                ) or changed
+        if material.get("id") == "customs_fee_invoice":
+            for rules_key in ["pdf_text_rules", "ocr_text_rules"]:
+                changed = ensure_rules(
+                    material,
+                    rules_key,
+                    any_values=customs_fee_any,
+                    regex_values=customs_fee_regex,
+                    all_values=["电子发票", "发票号码"],
+                ) or changed
+        if material.get("id") == "bill_of_lading":
+            patterns = material.setdefault("file_name_patterns", [])
+            for pattern in ["海运提单"]:
+                if pattern not in patterns:
+                    patterns.append(pattern)
+                    changed = True
+
+            for rules_key in ["pdf_text_rules", "ocr_text_rules"]:
+                changed = ensure_rules(
+                    material,
+                    rules_key,
+                    any_values=bill_any,
+                    regex_values=bill_regex,
+                ) or changed
+        if material.get("id") == "packing_list":
+            for rules_key in ["pdf_text_rules", "ocr_text_rules"]:
+                changed = ensure_rules(
+                    material,
+                    rules_key,
+                    any_values=packing_any,
+                    regex_values=packing_regex,
+                ) or changed
+        if material.get("id") == "freight_invoice":
+            for rules_key in ["pdf_text_rules", "ocr_text_rules"]:
+                changed = ensure_rules(
+                    material,
+                    rules_key,
+                    any_values=freight_any,
+                    regex_values=freight_regex,
+                    all_values=["电子发票", "发票号码"],
+                ) or changed
     if changed:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -835,13 +1145,14 @@ def ocr_text(filepath: str, max_pdf_pages: int = 1) -> str:
 def extract_declaration_number(text: str) -> str:
     if not text:
         return ""
-    candidates = re.findall(r"\b\d{15,24}\b", text)
+    candidates = re.findall(r"\b\d{15,24}\b", normalize_document_text(text))
     return candidates[0] if candidates else ""
 
 
 def extract_amounts(text: str) -> list[float]:
     amounts = []
-    for match in re.findall(r"(?:USD|RMB|CNY|¥|\$)?\s*-?\d[\d,]*(?:\.\d{1,4})?", text or "", re.IGNORECASE):
+    normalized_text = normalize_document_text(text)
+    for match in re.findall(r"(?:USD|RMB|CNY|¥|\$)?\s*-?\d[\d,]*(?:\.\d{1,4})?", normalized_text, re.IGNORECASE):
         amount = normalize_amount(match)
         if amount is not None:
             amounts.append(amount)
@@ -852,6 +1163,7 @@ def extract_dates(text: str) -> list[str]:
     values = []
     if not text:
         return values
+    text = normalize_document_text(text)
 
     patterns = [
         r"\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b",
@@ -867,21 +1179,26 @@ def extract_dates(text: str) -> list[str]:
 
 
 def extract_document_fields(material_id: str, text: str, filename: str) -> dict:
-    haystack = f"{filename}\n{text or ''}"
+    raw_haystack = f"{filename}\n{text or ''}"
+    haystack = normalize_document_text(raw_haystack)
+    content_text = normalize_document_text(text or "")
+    invoice_candidates = re.findall(r"\b[A-Z]{1,4}\d{6,12}\b", haystack, re.IGNORECASE)
+    invoice_candidates.extend(re.findall(r"\b\d{6,12}\b", haystack))
     fields = {
-        "invoice_numbers": re.findall(r"\b[A-Z]{1,4}\d{6,12}\b", haystack, re.IGNORECASE),
+        "invoice_numbers": sorted(set(invoice_candidates)),
         "customs_declaration_numbers": [],
         "bl_numbers": [],
         "booking_refs": [],
         "container_numbers": [],
         "seal_numbers": [],
-        "amounts": extract_amounts(haystack),
-        "dates": extract_dates(haystack),
+        "amounts": extract_amounts(content_text),
+        "dates": extract_dates(content_text),
         "countries": [],
-        "raw_text_sample": re.sub(r"\s+", " ", haystack).strip()[:500],
+        "raw_text_sample": re.sub(r"\s+", " ", raw_haystack).strip()[:500],
+        "normalized_text_sample": haystack[:500],
     }
 
-    upper = haystack.upper()
+    upper = content_text.upper()
     for key, country in COUNTRY_MAP.items():
         if key in upper and country not in fields["countries"]:
             fields["countries"].append(country)
@@ -970,27 +1287,7 @@ class MaterialClassifier:
                     "status": "matched" if score >= self.manual_score else "unrecognized",
                     "reasons": reasons,
                     "text": "",
-                }
-
-        for material in self.materials:
-            if material.get("file_name_only"):
-                continue
-            if material.get("id") == "customs_power_of_attorney":
-                continue
-            score, reasons = self._score_file_name(material, stripped_name)
-            if score >= self.auto_score:
-                return {
-                    "filename": filename,
-                    "path": filepath,
-                    "stripped_name": stripped_name,
-                    "material": material,
-                    "material_id": material["id"],
-                    "material_name": material["name"],
-                    "required": bool(material.get("required")),
-                    "score": score,
-                    "status": "matched",
-                    "reasons": reasons,
-                    "text": "",
+                    "normalized_text": "",
                 }
 
         text_cache = {"pdf": None, "ocr": None}
@@ -1021,7 +1318,16 @@ class MaterialClassifier:
                 item for item in all_scores
                 if item["material_id"] != best["material"]["id"] and abs(item["score"] - best["score"]) <= 10
             ]
-            status = "manual_review" if tied or best["score"] < self.auto_score else "matched"
+            has_content_match = any(
+                reason.startswith(("PDF", "OCR"))
+                for reason in best["reasons"]
+            )
+            if best["material"].get("file_name_only"):
+                status = "matched" if best["score"] >= self.manual_score else "unrecognized"
+            elif tied or best["score"] < self.auto_score or not has_content_match:
+                status = "manual_review"
+            else:
+                status = "matched"
             material = best["material"]
 
         text = ""
@@ -1042,6 +1348,7 @@ class MaterialClassifier:
             "status": status,
             "reasons": best["reasons"] if best else [],
             "text": text,
+            "normalized_text": normalize_document_text(text),
         }
 
     def _score_material(self, material: dict, filepath: str, stripped_name: str, text_cache: dict) -> tuple[int, list[str]]:
@@ -1081,12 +1388,12 @@ class MaterialClassifier:
         reasons = []
         for pattern in material.get("file_name_patterns", []):
             if keyword_match(pattern, stripped_name):
-                score += 60
+                score += 60 if material.get("file_name_only") else 25
                 reasons.append(f"文件名命中:{pattern}")
                 break
         final_name = material.get("final_name") or material.get("name")
         if final_name and keyword_match(final_name, stripped_name):
-            score += 20
+            score += 20 if material.get("file_name_only") else 15
             reasons.append(f"文件名标准名命中:{final_name}")
         return score, reasons
 
@@ -1094,24 +1401,25 @@ class MaterialClassifier:
     def _score_text_rules(rules: dict, text: str, source: str) -> tuple[int, list[str]]:
         if not text:
             return 0, []
+        normalized_text = normalize_document_text(text)
         score = 0
         reasons = []
         match_count = 0
 
         all_patterns = rules.get("all", [])
-        if all_patterns and all(keyword_match(pattern, text) for pattern in all_patterns):
+        if all_patterns and all(keyword_match(pattern, normalized_text) for pattern in all_patterns):
             score += 50
             match_count += len(all_patterns)
             reasons.append(f"{source}全部命中:{','.join(all_patterns)}")
 
         for pattern in rules.get("any", []):
-            if keyword_match(pattern, text):
+            if keyword_match(pattern, normalized_text):
                 score += 20
                 match_count += 1
                 reasons.append(f"{source}命中:{pattern}")
 
         for pattern in rules.get("regex_any", []):
-            if re.search(pattern, text, re.IGNORECASE):
+            if re.search(pattern, normalized_text, re.IGNORECASE):
                 score += 20
                 match_count += 1
                 reasons.append(f"{source}正则命中:{pattern}")
@@ -1133,6 +1441,7 @@ def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: 
     score = 0
     evidence = []
     conflicts = []
+    unverified = []
 
     sales = docs.get("export_sales")
     customs = docs.get("customs_power_of_attorney")
@@ -1158,6 +1467,8 @@ def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: 
 
     if ledger_record and not ledger_invoice_ok:
         conflicts.append("台账发票号与当前发票号不一致")
+    if not ledger_record:
+        unverified.extend(["台账发票号未核验", "台账金额未核验", "台账目的国未核验", "台账出运日期未核验"])
 
     customs_decl_ok = False
     if customs:
@@ -1224,6 +1535,8 @@ def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: 
             evidence.append("台账金额与外销发票金额一致(+15)")
         elif ledger_amount is not None and sales_amounts:
             conflicts.append("台账金额与外销发票金额未匹配")
+        elif ledger_amount in (None, ""):
+            unverified.append("台账金额未核验")
 
         ledger_country = ledger_record.get("目的国", "")
         sales_countries = sales.get("fields", {}).get("countries", [])
@@ -1233,6 +1546,8 @@ def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: 
             evidence.append("台账目的国与外销发票国家一致(+10)")
         elif ledger_country and sales_countries:
             conflicts.append("台账目的国与外销发票国家不一致")
+        elif not ledger_country:
+            unverified.append("台账目的国未核验")
 
     if ledger_record and bill:
         ledger_date = ledger_record.get("出运日期", "")
@@ -1243,6 +1558,8 @@ def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: 
             evidence.append("台账出运日期与提单日期接近(+15)")
         elif ledger_date and bill_dates:
             conflicts.append("台账出运日期与提单日期相差过大")
+        elif not ledger_date:
+            unverified.append("台账出运日期未核验")
 
     strong_combo = any([
         sales_invoice_ok and ledger_amount_ok and ledger_country_ok,
@@ -1270,6 +1587,7 @@ def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: 
         "score": score,
         "evidence": evidence,
         "conflicts": conflicts,
+        "unverified": sorted(set(unverified)),
         "strong_combo": strong_combo,
     }
 
@@ -1286,6 +1604,7 @@ class TaxRefundProcessor:
         self.declarations = self._load_declarations()
 
     def resolve_target_folder(self, invoice_no: str) -> str:
+        os.makedirs(self.output_dir, exist_ok=True)
         original = os.path.join(self.output_dir, sanitize_folder_name(invoice_no))
 
         digits = invoice_digits(invoice_no)
@@ -1371,6 +1690,7 @@ class TaxRefundProcessor:
                     "闭环分数": "",
                     "闭环证据": "",
                     "闭环冲突": "",
+                    "闭环未核验": "",
                     "是否已改名": "否",
                     "最后更新时间": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "备注": "输出目录中未找到该发票号文件夹",
@@ -1446,7 +1766,10 @@ class TaxRefundProcessor:
                 continue
             material = item.get("material") or {}
             if not material.get("file_name_only"):
-                item["text"] = item.get("text") or self._document_text(item["path"])
+                if Path(item["path"]).suffix.lower() == ".pdf":
+                    item["text"] = self._document_text(item["path"]) or item.get("text", "")
+                else:
+                    item["text"] = item.get("text") or self._document_text(item["path"])
             item["fields"] = extract_document_fields(item["material_id"], item.get("text", ""), item["filename"])
 
         required_names = self.classifier.required_names()
@@ -1522,6 +1845,7 @@ class TaxRefundProcessor:
             "闭环分数": closed_loop["score"],
             "闭环证据": "；".join(closed_loop["evidence"]),
             "闭环冲突": "；".join(closed_loop["conflicts"]),
+            "闭环未核验": "；".join(closed_loop.get("unverified", [])),
             "是否已改名": "是" if status == "已改名" else "否",
             "最后更新时间": time.strftime("%Y-%m-%d %H:%M:%S"),
             "备注": "",
@@ -1673,7 +1997,7 @@ class TaxRefundProcessor:
         headers = [
             "发票号", "最终发票号显示值", "报关号", "当前文件夹", "最终文件夹",
             "状态", "已识别必需材料", "缺少材料", "未识别文件", "重复材料",
-            "需人工确认文件", "闭环状态", "闭环分数", "闭环证据", "闭环冲突",
+            "需人工确认文件", "闭环状态", "闭环分数", "闭环证据", "闭环冲突", "闭环未核验",
             "是否已改名", "最后更新时间", "备注",
         ]
         wb = openpyxl.Workbook()
@@ -1683,7 +2007,7 @@ class TaxRefundProcessor:
         ExcelLogger._style_header(ws, headers)
         for record in sorted(records, key=lambda item: item.get("发票号", "")):
             ws.append([record.get(header, "") for header in headers])
-        widths = [16, 18, 24, 45, 45, 14, 28, 28, 38, 28, 38, 16, 12, 55, 45, 12, 22, 40]
+        widths = [16, 18, 24, 45, 45, 14, 28, 28, 38, 28, 38, 16, 12, 55, 45, 45, 12, 22, 40]
         for col_idx, width in enumerate(widths, start=1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
         wb.save(path)
@@ -2096,6 +2420,7 @@ def save_batch_report_excel(records: list[dict], path: str):
         "闭环分数",
         "闭环证据",
         "闭环冲突",
+        "闭环未核验",
         "报关号",
         "最后更新时间",
         "备注",
@@ -2266,6 +2591,7 @@ class FinanceBatchProcessor:
                 "闭环分数": record.get("闭环分数", ""),
                 "闭环证据": record.get("闭环证据", ""),
                 "闭环冲突": record.get("闭环冲突", ""),
+                "闭环未核验": record.get("闭环未核验", ""),
                 "报关号": record.get("报关号", ""),
                 "最后更新时间": record.get("最后更新时间", ""),
                 "备注": remarks,
@@ -2433,7 +2759,8 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                  invoice_matcher: InvoiceMatcher, executor: ThreadPoolExecutor,
                  log_callback, pending_set: set, tax_processor: TaxRefundProcessor = None,
                  declaration_prompt_callback=None, company_ledger_path: str = "",
-                 finance_batch_name: str = "", ledger_sync_manager: CompanyLedgerSyncManager = None):
+                 finance_batch_name: str = "", ledger_sync_manager: CompanyLedgerSyncManager = None,
+                 watch_dir: str = ""):
         if Observer:
             super().__init__()
         self.output_dir = output_dir
@@ -2447,6 +2774,7 @@ class FileHandler(FileSystemEventHandler if Observer else object):
         self.company_ledger_path = company_ledger_path
         self.finance_batch_name = finance_batch_name
         self.ledger_sync_manager = ledger_sync_manager
+        self.watch_dir = normalize_path(watch_dir) if watch_dir else ""
         self._lock = threading.Lock()
 
     def on_closed(self, event):
@@ -2457,6 +2785,10 @@ class FileHandler(FileSystemEventHandler if Observer else object):
     def on_created(self, event):
         if not event.is_directory:
             self._schedule(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._schedule(event.dest_path)
 
     def _schedule(self, filepath: str):
         if should_ignore_file(filepath):
@@ -2506,6 +2838,7 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                     if self.tax_processor
                     else None
                 ),
+                source_root=self.watch_dir,
             )
             if success and status == "成功":
                 self.log_callback(f"✅ {msg}", processed=True)
@@ -2884,6 +3217,7 @@ class App(tk.Tk):
             company_ledger_path=str(invoice_workbook),
             finance_batch_name=settings.get("finance_batch", {}).get("last_batch_name", ""),
             ledger_sync_manager=self.ledger_sync_manager,
+            watch_dir=watch,
         )
 
         self.observer = Observer()
