@@ -1,0 +1,49 @@
+project:
+  name: contract-router
+  type: python-pyinstaller
+  remote_root: 'C:\dev\contract-router'
+
+windows:
+  host_alias: win-native
+  shell: powershell
+  timeout_minutes: 60
+
+sync:
+  mode: manual
+  repo_url: 'https://github.com/Andy20010101/contract-router.git'
+  branch: current
+
+commands:
+  precheck:
+    - 'git --version'
+    - 'py -3.12 --version'
+    - '$PSVersionTable.PSVersion.ToString()'
+
+  setup:
+    - 'py -3.12 -m venv .venv'
+    - '.\.venv\Scripts\python.exe -m pip install --upgrade pip'
+    - '.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt'
+    - '.\.venv\Scripts\python.exe -m pip install pytest'
+
+  source_tests:
+    - '.\.venv\Scripts\python.exe -m pytest -q'
+    - 'if (Test-Path -LiteralPath .\tmp\e2e\source) { Remove-Item -LiteralPath .\tmp\e2e\source -Recurse -Force }; New-Item -ItemType Directory -Force -Path .\tmp\e2e\source\input,.\tmp\e2e\source\output,.\tmp\e2e\source\logs | Out-Null; .\.venv\Scripts\python.exe .\file_classifier.py e2e --input .\tmp\e2e\source\input --output .\tmp\e2e\source\output --report .\tmp\e2e\source\report.json --log .\tmp\e2e\source\logs\e2e.log'
+
+  build:
+    - '.\build_windows.bat'
+
+  exe_e2e:
+    - 'if (Test-Path -LiteralPath .\tmp\e2e\exe) { Remove-Item -LiteralPath .\tmp\e2e\exe -Recurse -Force }; New-Item -ItemType Directory -Force -Path .\tmp\e2e\exe\input,.\tmp\e2e\exe\output,.\tmp\e2e\exe\logs | Out-Null; .\dist\contract-router.exe e2e --input .\tmp\e2e\exe\input --output .\tmp\e2e\exe\output --report .\tmp\e2e\exe\report.json --log .\tmp\e2e\exe\logs\e2e.log'
+
+artifacts:
+  remote:
+    - 'tmp\e2e\**'
+    - 'dist\contract-router.exe'
+    - 'build\file_classifier\warn-file_classifier.txt'
+  local_dir: '.e2e-artifacts/windows'
+
+checks:
+  required_files:
+    - 'tmp\e2e\source\report.json'
+    - 'tmp\e2e\exe\report.json'
+    - 'dist\contract-router.exe'

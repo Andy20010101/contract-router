@@ -26,6 +26,7 @@ import queue
 import json
 import tempfile
 import unicodedata
+import argparse
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -3428,6 +3429,567 @@ class App(tk.Tk):
 
 
 # ─────────────────────────────────────────────
+# Shell E2E test-mode
+# ─────────────────────────────────────────────
+
+E2E_REPORT_SCHEMA = "contract-router-e2e/v1"
+
+
+def e2e_fixture_texts() -> dict[str, str]:
+    return {
+        "random_a.pdf": (
+            "PROFORMA INVOICE\n"
+            "Invoice No. 25117260\n"
+            "JIAXING LAYO\n"
+            "Transport details\n"
+            "Terms of payment\n"
+            "Description of goods\n"
+            "POLAND\n"
+            "USD 100.00"
+        ),
+        "scan001.pdf": (
+            "报关委托书\n"
+            "代理报关委托\n"
+            "报关单编号 123456789012345\n"
+            "一般贸易\n"
+            "177FCWCWS64050\n"
+            "7"
+        ),
+        "20260212.pdf": (
+            "电子发票\n"
+            "发票号码 12345678\n"
+            "国内货物运输代理服务\n"
+            "报关\n"
+            "嘉兴新锴国际货运代理\n"
+            "177FCWCWS640507"
+        ),
+        "docx_export.pdf": (
+            "OCEAN BILL OF LADING\n"
+            "SHIPPER\n"
+            "CONSIGNEE\n"
+            "NOTIFY PARTY\n"
+            "FREIGHT COLLECT\n"
+            "SHIPPED ON BOARD\n"
+            "SHIPPER'S LOAD COUNT\n"
+            "B/L No. ESHGDN2600603\n"
+            "Container MSBU5039559 Seal FX45652534\n"
+            "12 CARTONS\n"
+            "1234.56KGS\n"
+            "MAY 20, 2026"
+        ),
+        "wechat_image.png": (
+            "CONTAINER LOAD PLAN\n"
+            "Container No. MSBU5039559\n"
+            "Seal No. FX45652534\n"
+            "Port of Loading SHANGHAI\n"
+            "Port of Discharge GDANSK\n"
+            "Place of Delivery GDANSK\n"
+            "Packing Date 2026-05-19\n"
+            "Total Packages 12\n"
+            "Total Cargo Wt 1234.56KGS\n"
+            "Total Meas 10\n"
+            "40HC\n"
+            "Bill of Lading No. 177FCWCWS64050\n"
+            "7"
+        ),
+        "invoice_unknown.pdf": (
+            "电子发票\n"
+            "发票号码 87654321\n"
+            "国际货运代理费\n"
+            "港口码头费\n"
+            "汇利达欧海国际货运代理\n"
+            "B/L No. ESHGDN2600603"
+        ),
+        "duplicate_export_sales.pdf": (
+            "PROFORMA INVOICE\n"
+            "Invoice No. LY25117260\n"
+            "JIAXING LAYO\n"
+            "Transport details\n"
+            "Terms of payment\n"
+            "Description of goods\n"
+            "POLAND\n"
+            "USD 100.00"
+        ),
+    }
+
+
+def _e2e_save_workbook(path: Path, sheets: dict[str, list[list[object]]]) -> None:
+    if openpyxl is None:
+        raise RuntimeError("缺少 openpyxl，无法生成 E2E 台账 fixture")
+    wb = openpyxl.Workbook()
+    first = True
+    try:
+        for title, rows in sheets.items():
+            ws = wb.active if first else wb.create_sheet(title)
+            ws.title = title
+            first = False
+            for row in rows:
+                ws.append(row)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        wb.save(path)
+    finally:
+        wb.close()
+
+
+def _e2e_write_dummy_files(folder: Path, filenames: list[str]) -> list[Path]:
+    folder.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for filename in filenames:
+        path = folder / filename
+        path.write_bytes(b"contract-router e2e fixture\n")
+        paths.append(path)
+    return paths
+
+
+def _e2e_split_marker_text(value: object) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in re.split(r"[、；;,]+", str(value)) if item.strip()]
+
+
+def _e2e_markers_from_record(record: dict) -> dict[str, list[str]]:
+    return {
+        "conflict": _e2e_split_marker_text(record.get("闭环冲突", "")),
+        "duplicate": _e2e_split_marker_text(record.get("重复材料", "")),
+        "unmatched": _e2e_split_marker_text(record.get("未识别文件", "")),
+    }
+
+
+def _e2e_assert(assertions: list[dict], name: str, passed: bool, details: object = "") -> None:
+    assertions.append({
+        "name": name,
+        "status": "passed" if passed else "failed",
+        "details": details,
+    })
+
+
+def _e2e_case_status(assertions: list[dict]) -> str:
+    return "passed" if all(item["status"] == "passed" for item in assertions) else "failed"
+
+
+def _e2e_record_summary(record: dict) -> dict:
+    keys = [
+        "发票号", "最终发票号显示值", "报关号", "状态", "已识别必需材料", "缺少材料",
+        "未识别文件", "重复材料", "需人工确认文件", "闭环状态", "闭环分数",
+        "闭环证据", "闭环冲突", "闭环未核验",
+    ]
+    return {key: record.get(key, "") for key in keys}
+
+
+def _run_e2e_random_filename_case(
+    fixture_root: Path,
+    output_root: Path,
+    config_path: Path,
+    ledger_records: dict,
+    logs: list[str],
+) -> dict:
+    assertions = []
+    source_root = fixture_root / "random_filenames"
+    incoming_dir = source_root / "25117260 raw"
+    filenames = [
+        "random_a.pdf",
+        "scan001.pdf",
+        "20260212.pdf",
+        "docx_export.pdf",
+        "wechat_image.png",
+        "invoice_unknown.pdf",
+    ]
+    source_files = _e2e_write_dummy_files(incoming_dir, filenames)
+    source_files.extend(_e2e_write_dummy_files(source_root, ["合同-优尚-25117260.jpg"]))
+
+    processor = TaxRefundProcessor(
+        str(output_root / "random_filenames"),
+        config_path=config_path,
+        ledger_records=ledger_records,
+    )
+    matcher = InvoiceMatcher(list(ledger_records.keys()))
+    moves = []
+    for source in source_files:
+        success, subfolder, message, dest_path, invoice_no, status = move_file_to_output(
+            str(source),
+            processor.output_dir,
+            matcher,
+            invoice_dir_resolver=processor.resolve_target_folder,
+            source_root=str(source_root),
+        )
+        moves.append({
+            "source": str(source),
+            "success": success,
+            "subfolder": subfolder,
+            "message": message,
+            "dest_path": dest_path,
+            "invoice_no": invoice_no,
+            "status": status,
+        })
+
+    invoice_folder = Path(processor.resolve_target_folder("LY25117260"))
+    record = processor.evaluate_invoice(
+        "LY25117260",
+        str(invoice_folder),
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+        persist_declaration=False,
+    )
+    evidence = record.get("闭环证据", "")
+    markers = _e2e_markers_from_record(record)
+
+    _e2e_assert(assertions, "all_random_named_files_match_same_invoice", all(
+        item["success"] and item["invoice_no"] == "LY25117260" for item in moves
+    ), moves)
+    _e2e_assert(assertions, "ly_prefix_and_digits_are_equivalent", invoice_equivalent(
+        "LY25117260",
+        record.get("最终发票号显示值", ""),
+    ), record.get("最终发票号显示值", ""))
+    _e2e_assert(assertions, "closed_loop_strong_pass", record.get("闭环状态") == "强闭环通过", _e2e_record_summary(record))
+    _e2e_assert(assertions, "customs_declaration_detected", record.get("报关号") == "123456789012345", record.get("报关号", ""))
+    _e2e_assert(assertions, "amount_country_date_evidence_present", all(
+        marker in evidence for marker in ["台账金额", "台账目的国", "台账出运日期"]
+    ), evidence)
+    _e2e_assert(assertions, "no_conflict_duplicate_or_unmatched_in_happy_path", not any(markers.values()), markers)
+
+    logs.append(f"random_filenames status={record.get('状态')} closed_loop={record.get('闭环状态')}")
+    return {
+        "name": "random_filenames_closed_loop",
+        "status": _e2e_case_status(assertions),
+        "assertions": assertions,
+        "markers": markers,
+        "record": _e2e_record_summary(record),
+        "moves": moves,
+    }
+
+
+def _run_e2e_amount_conflict_case(
+    output_root: Path,
+    config_path: Path,
+    text_map: dict[str, str],
+    logs: list[str],
+) -> dict:
+    assertions = []
+    folder = output_root / "amount_conflict" / "LY25117260"
+    _e2e_write_dummy_files(folder, [
+        "random_a.pdf",
+        "scan001.pdf",
+        "20260212.pdf",
+        "docx_export.pdf",
+        "wechat_image.png",
+        "invoice_unknown.pdf",
+    ])
+    ledger_records = {
+        "LY25117260": {
+            "发票号": "LY25117260",
+            "金额": 999,
+            "目的国": "波兰",
+            "出运日期": "2026-05-20",
+        }
+    }
+    processor = TaxRefundProcessor(
+        str(output_root / "amount_conflict"),
+        config_path=config_path,
+        ledger_records=ledger_records,
+    )
+    record = processor.evaluate_invoice(
+        "LY25117260",
+        str(folder),
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+        persist_declaration=False,
+    )
+    markers = _e2e_markers_from_record(record)
+
+    _e2e_assert(assertions, "amount_conflict_marked", any(
+        "金额" in item for item in markers["conflict"]
+    ), markers)
+    _e2e_assert(assertions, "amount_conflict_not_accepted", record.get("状态") not in {"可改名", "已改名"}, _e2e_record_summary(record))
+    _e2e_assert(assertions, "conflict_fixture_uses_same_invoice_content", invoice_equivalent(
+        "LY25117260",
+        text_map["random_a.pdf"].split("Invoice No.", 1)[1].splitlines()[0].strip(),
+    ), text_map["random_a.pdf"])
+
+    logs.append(f"amount_conflict status={record.get('状态')} conflicts={record.get('闭环冲突')}")
+    return {
+        "name": "amount_conflict",
+        "status": _e2e_case_status(assertions),
+        "assertions": assertions,
+        "markers": markers,
+        "record": _e2e_record_summary(record),
+    }
+
+
+def _run_e2e_duplicate_case(
+    output_root: Path,
+    config_path: Path,
+    ledger_records: dict,
+    logs: list[str],
+) -> dict:
+    assertions = []
+    folder = output_root / "duplicate_invoice_material" / "LY25117260"
+    _e2e_write_dummy_files(folder, [
+        "random_a.pdf",
+        "duplicate_export_sales.pdf",
+        "scan001.pdf",
+        "20260212.pdf",
+        "docx_export.pdf",
+        "wechat_image.png",
+        "invoice_unknown.pdf",
+    ])
+    processor = TaxRefundProcessor(
+        str(output_root / "duplicate_invoice_material"),
+        config_path=config_path,
+        ledger_records=ledger_records,
+    )
+    record = processor.evaluate_invoice(
+        "LY25117260",
+        str(folder),
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+        persist_declaration=False,
+    )
+    markers = _e2e_markers_from_record(record)
+    warnings = []
+    if markers["duplicate"] and record.get("状态") in {"可改名", "已改名"}:
+        warnings.append("duplicate marker exists, but application record status is still accepted")
+
+    _e2e_assert(assertions, "duplicate_invoice_material_marked", bool(markers["duplicate"]), markers)
+    _e2e_assert(assertions, "duplicate_marker_names_invoice_file", any(
+        name in {"random_a.pdf", "duplicate_export_sales.pdf"} for name in markers["duplicate"]
+    ), markers)
+
+    logs.append(f"duplicate_invoice_material status={record.get('状态')} duplicate={record.get('重复材料')}")
+    return {
+        "name": "duplicate_invoice_material",
+        "status": _e2e_case_status(assertions),
+        "assertions": assertions,
+        "warnings": warnings,
+        "markers": markers,
+        "record": _e2e_record_summary(record),
+    }
+
+
+def _run_e2e_unmatched_case(
+    fixture_root: Path,
+    output_root: Path,
+    ledger_records: dict,
+    logs: list[str],
+) -> dict:
+    assertions = []
+    source_root = fixture_root / "unmatched"
+    source_file = _e2e_write_dummy_files(source_root, ["totally_unrelated_file.pdf"])[0]
+    matcher = InvoiceMatcher(list(ledger_records.keys()))
+    success, subfolder, message, dest_path, invoice_no, status = move_file_to_output(
+        str(source_file),
+        str(output_root / "unmatched"),
+        matcher,
+        source_root=str(source_root),
+    )
+    event = {
+        "source": str(source_file),
+        "success": success,
+        "subfolder": subfolder,
+        "message": message,
+        "dest_path": dest_path,
+        "invoice_no": invoice_no,
+        "status": status,
+    }
+    markers = {
+        "conflict": [],
+        "duplicate": [],
+        "unmatched": [Path(dest_path).name] if success and status == "未匹配" else [],
+    }
+
+    _e2e_assert(assertions, "unrelated_file_marked_unmatched", bool(markers["unmatched"]), event)
+    _e2e_assert(assertions, "unrelated_file_goes_to_review_folder", subfolder == REVIEW_SUBFOLDER, event)
+    _e2e_assert(assertions, "unrelated_file_has_no_invoice_match", invoice_no == "", event)
+
+    logs.append(f"unmatched status={status} dest={dest_path}")
+    return {
+        "name": "unrelated_file_unmatched",
+        "status": _e2e_case_status(assertions),
+        "assertions": assertions,
+        "markers": markers,
+        "moves": [event],
+    }
+
+
+def _write_e2e_report(report_path: Path, report: dict) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+
+def run_contract_router_e2e(
+    input_dir: str | Path,
+    output_dir: str | Path,
+    report_path: str | Path,
+    log_path: str | Path | None = None,
+) -> int:
+    started_at = datetime.now().isoformat(timespec="seconds")
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    report_path = Path(report_path)
+    log_path = Path(log_path) if log_path else output_dir / "logs" / "e2e.log"
+    run_id = f"run-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+    fixture_root = input_dir / run_id
+    run_output = output_dir / run_id
+    logs = [
+        f"started_at={started_at}",
+        f"run_id={run_id}",
+        f"fixture_root={fixture_root}",
+        f"run_output={run_output}",
+    ]
+
+    original_pdf_text = globals()["pdf_text"]
+    original_ocr_text = globals()["ocr_text"]
+    try:
+        fixture_root.mkdir(parents=True, exist_ok=True)
+        run_output.mkdir(parents=True, exist_ok=True)
+        text_map = e2e_fixture_texts()
+
+        def fixture_text(filepath: str, *args, **kwargs) -> str:
+            del args, kwargs
+            return text_map.get(Path(filepath).name, "")
+
+        globals()["pdf_text"] = fixture_text
+        globals()["ocr_text"] = fixture_text
+
+        ledger_path = fixture_root / "ledger.xlsx"
+        _e2e_save_workbook(
+            ledger_path,
+            {
+                "台账": [
+                    ["发票号", "出运日期", "目的国(地区)", "金额"],
+                    ["LY25117260", "2026-05-20", "波兰", 100],
+                    ["LY25117261", "2026-05-21", "德国", 200],
+                ],
+            },
+        )
+        ledger_records = load_invoice_records(str(ledger_path))
+        config_path = fixture_root / "materials_config.json"
+
+        cases = [
+            _run_e2e_random_filename_case(
+                fixture_root,
+                run_output,
+                config_path,
+                ledger_records,
+                logs,
+            ),
+            _run_e2e_amount_conflict_case(
+                run_output,
+                config_path,
+                text_map,
+                logs,
+            ),
+            _run_e2e_duplicate_case(
+                run_output,
+                config_path,
+                ledger_records,
+                logs,
+            ),
+            _run_e2e_unmatched_case(
+                fixture_root,
+                run_output,
+                ledger_records,
+                logs,
+            ),
+        ]
+        marker_counts = {
+            key: sum(len(case.get("markers", {}).get(key, [])) for case in cases)
+            for key in ["conflict", "duplicate", "unmatched"]
+        }
+        warnings = [
+            {"case": case["name"], "message": warning}
+            for case in cases
+            for warning in case.get("warnings", [])
+        ]
+        report_status = "passed" if all(case["status"] == "passed" for case in cases) else "failed"
+        ended_at = datetime.now().isoformat(timespec="seconds")
+        report = {
+            "schema": E2E_REPORT_SCHEMA,
+            "status": report_status,
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "run_id": run_id,
+            "input": str(input_dir),
+            "output": str(output_dir),
+            "fixture_root": str(fixture_root),
+            "run_output": str(run_output),
+            "summary": {
+                "total": len(cases),
+                "passed": sum(1 for case in cases if case["status"] == "passed"),
+                "failed": sum(1 for case in cases if case["status"] != "passed"),
+                "markers": marker_counts,
+                "warnings": len(warnings),
+            },
+            "warnings": warnings,
+            "cases": cases,
+        }
+        _write_e2e_report(report_path, report)
+        logs.append(f"ended_at={ended_at}")
+        logs.append(f"status={report_status}")
+        logs.append(f"report={report_path}")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("\n".join(logs) + "\n", encoding="utf-8")
+        print(f"[contract-router-e2e] report={report_path}")
+        print(f"[contract-router-e2e] status={report_status}")
+        return 0 if report_status == "passed" else 1
+    except Exception as exc:
+        ended_at = datetime.now().isoformat(timespec="seconds")
+        report = {
+            "schema": E2E_REPORT_SCHEMA,
+            "status": "failed",
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "run_id": run_id,
+            "input": str(input_dir),
+            "output": str(output_dir),
+            "fixture_root": str(fixture_root),
+            "run_output": str(run_output),
+            "summary": {
+                "total": 0,
+                "passed": 0,
+                "failed": 1,
+                "markers": {"conflict": 0, "duplicate": 0, "unmatched": 0},
+                "warnings": 0,
+            },
+            "warnings": [],
+            "error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            },
+            "cases": [],
+        }
+        _write_e2e_report(report_path, report)
+        logs.append(f"error={type(exc).__name__}: {exc}")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("\n".join(logs) + "\n", encoding="utf-8")
+        print(f"[contract-router-e2e] failed: {exc}", file=sys.stderr)
+        print(f"[contract-router-e2e] report={report_path}")
+        return 1
+    finally:
+        globals()["pdf_text"] = original_pdf_text
+        globals()["ocr_text"] = original_ocr_text
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Contract Router")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    e2e_parser = subparsers.add_parser("e2e", help="Run shell-based E2E test-mode and write report.json.")
+    e2e_parser.add_argument("--input", required=True, help="Fixture input/work directory.")
+    e2e_parser.add_argument("--output", required=True, help="E2E output directory.")
+    e2e_parser.add_argument("--report", required=True, help="Machine-readable report.json path.")
+    e2e_parser.add_argument("--log", help="Optional E2E log path.")
+
+    args = parser.parse_args(argv)
+    if args.command == "e2e":
+        return run_contract_router_e2e(args.input, args.output, args.report, args.log)
+    parser.error("unknown command")
+    return 2
+
+
+# ─────────────────────────────────────────────
 # 依赖检查与安装提示
 # ─────────────────────────────────────────────
 
@@ -3460,6 +4022,9 @@ def check_and_install_deps():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in {"e2e", "-h", "--help"}:
+        sys.exit(main(sys.argv[1:]))
+
     check_and_install_deps()
 
     # 重新导入（安装后）

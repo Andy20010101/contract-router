@@ -884,3 +884,29 @@ def test_file_handler_sync_failure_does_not_affect_processing(monkeypatch, tmp_p
     assert logger.saved >= 1
     assert str(source) not in handler.pending_set
     assert any("公司主台账状态同步失败" in message for message, _ in logs)
+
+
+def test_shell_e2e_report_marks_conflict_duplicate_and_unmatched(tmp_path):
+    report_path = tmp_path / "report.json"
+    exit_code = fc.run_contract_router_e2e(
+        tmp_path / "input",
+        tmp_path / "output",
+        report_path,
+        tmp_path / "logs" / "e2e.log",
+    )
+
+    assert exit_code == 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["schema"] == fc.E2E_REPORT_SCHEMA
+    assert report["status"] == "passed"
+    assert report["summary"]["markers"]["conflict"] >= 1
+    assert report["summary"]["markers"]["duplicate"] >= 1
+    assert report["summary"]["markers"]["unmatched"] >= 1
+
+    cases = {case["name"]: case for case in report["cases"]}
+    assert cases["random_filenames_closed_loop"]["record"]["闭环状态"] == "强闭环通过"
+    assert cases["random_filenames_closed_loop"]["record"]["报关号"] == "123456789012345"
+    assert cases["random_filenames_closed_loop"]["record"]["最终发票号显示值"] == "25117260"
+    assert any("金额" in item for item in cases["amount_conflict"]["markers"]["conflict"])
+    assert cases["duplicate_invoice_material"]["markers"]["duplicate"]
+    assert "totally_unrelated_file.pdf" in cases["unrelated_file_unmatched"]["markers"]["unmatched"]

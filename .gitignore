@@ -4,3 +4,9 @@ __pycache__/
 node_modules/
 .omx/
 .venv/
+
+# Build and E2E outputs
+/build/
+/dist/
+/tmp/
+/.e2e-artifacts/
