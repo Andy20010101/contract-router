@@ -1,0 +1,326 @@
+{
+  "schema": "contract-router-anonymized-material-fixtures/v1",
+  "description": "Three desensitized real-world material sets. Original files are not stored; texts preserve recognition and closed-loop signals with synthetic identifiers.",
+  "sets": [
+    {
+      "id": "real_set_a_multi_factory_contracts",
+      "invoice_no": "LY90017023",
+      "declaration_no": "910120260000000001",
+      "ledger": {
+        "发票号": "LY90017023",
+        "金额": 2542.9,
+        "目的国": "美国",
+        "出运日期": "2026-04-11"
+      },
+      "files": [
+        {
+          "filename": "scan_a_001.pdf",
+          "material_id": "export_sales",
+          "text": [
+            "PROFORMA INVOICE",
+            "Invoice No. 90017023",
+            "JIAXING LAYO IMPORT & EXPORT GROUP CO.,LTD.",
+            "Transport details",
+            "Terms of payment",
+            "Description of goods",
+            "Destination U.S.A.",
+            "USD 2542.90",
+            "Date 2026-04-03"
+          ]
+        },
+        {
+          "filename": "scan_a_002.pdf",
+          "material_id": "customs_power_of_attorney",
+          "text": [
+            "报关委托书",
+            "代理报关委托",
+            "报关单编号 910120260000000001",
+            "一般贸易",
+            "177FCLCLS90017023"
+          ]
+        },
+        {
+          "filename": "scan_a_003.pdf",
+          "material_id": "customs_fee_invoice",
+          "text": [
+            "电子发票",
+            "发票号码 9001702301",
+            "国内货物运输代理服务",
+            "报关",
+            "嘉兴新锴国际货运代理",
+            "177FCLCLS90017023"
+          ]
+        },
+        {
+          "filename": "scan_a_004.pdf",
+          "material_id": "bill_of_lading",
+          "text": [
+            "BILLOFLADING",
+            "Shipper",
+            "Consignee",
+            "NotifyParty",
+            "Bill of Lading No. BLSEA90017023",
+            "Port of loading SHANGHAI",
+            "Port of discharge ROTTERDAM",
+            "Place of delivery ROTTERDAM",
+            "FREIGHT COLLECT",
+            "CONTAINER NO. TCLU9001701",
+            "SEAL NO. SL9001701",
+            "SIZE 40HQ",
+            "224 CARTONS",
+            "2542.90KGS",
+            "SHIPPED ON BOARD DATE: Apr 11, 2026",
+            "TELEX RELEASE ORIGINAL B/L SURRENDERED"
+          ]
+        },
+        {
+          "filename": "scan_a_005.jpg",
+          "material_id": "packing_list",
+          "text": [
+            "CONTAINER LOAD PLAN",
+            "Container No. TCLU9001701",
+            "Seal No. SL9001701",
+            "Port of Loading SHANGHAI",
+            "Port of Discharge ROTTERDAM",
+            "Place of Delivery ROTTERDAM",
+            "Packing Date 2026-04-10",
+            "Total Packages 224",
+            "Total Cargo Wt 2542.90KGS",
+            "Total Meas 24.020",
+            "40HQ",
+            "Bill of Lading No. 177FCLCLS90017023"
+          ]
+        },
+        {
+          "filename": "scan_a_006.jpg",
+          "material_id": "freight_invoice",
+          "text": [
+            "电子发票",
+            "发票号码 9001702302",
+            "国际货运代理费",
+            "港口码头费",
+            "汇利达欧海国际货运代理",
+            "B/L No. BLSEA90017023",
+            "2026-05-12"
+          ]
+        }
+      ],
+      "purchase_contracts": [
+        "采购合同-工厂A-90017023.jpg",
+        "采购合同-工厂B-90017023.jpg",
+        "采购合同-工厂C-90017023.jpg"
+      ]
+    },
+    {
+      "id": "real_set_b_single_factory_waybill",
+      "invoice_no": "LY90017241",
+      "declaration_no": "910120260000000002",
+      "ledger": {
+        "发票号": "LY90017241",
+        "金额": 9479.14,
+        "目的国": "美国",
+        "出运日期": "2026-03-23"
+      },
+      "files": [
+        {
+          "filename": "scan_b_001.pdf",
+          "material_id": "export_sales",
+          "text": [
+            "PROFORMA INVOICE",
+            "Invoice No. LY90017241",
+            "JIAXING LAYO IMPORT & EXPORT GROUP CO.,LTD.",
+            "Transport details",
+            "Terms of payment",
+            "Description of goods",
+            "Destination U.S.A.",
+            "USD 9479.14",
+            "Date 2026-03-16"
+          ]
+        },
+        {
+          "filename": "scan_b_002.pdf",
+          "material_id": "customs_power_of_attorney",
+          "text": [
+            "报关委托书",
+            "代理报关委托",
+            "报关单编号 910120260000000002",
+            "一般贸易",
+            "177FSHSHS90017241"
+          ]
+        },
+        {
+          "filename": "scan_b_003.pdf",
+          "material_id": "customs_fee_invoice",
+          "text": [
+            "电子发票",
+            "发票号码 9001724101",
+            "国内货物运输代理服务",
+            "报关",
+            "嘉兴新锴国际货运代理",
+            "177FSHSHS90017241"
+          ]
+        },
+        {
+          "filename": "scan_b_004.pdf",
+          "material_id": "bill_of_lading",
+          "text": [
+            "SEA WAYBILL",
+            "SHIPPER",
+            "CONSIGNEE",
+            "NOTIFY PARTY",
+            "SHIPPER'S LOAD,COUNT AND SEAL",
+            "FREIGHT COLLECT",
+            "B/L No. SEAWB90017241",
+            "Container ONEU9001741",
+            "Seal SL9001741",
+            "61 CARTONS",
+            "9479.14KGS",
+            "MAR 23, 2026"
+          ]
+        },
+        {
+          "filename": "scan_b_005.jpeg",
+          "material_id": "packing_list",
+          "text": [
+            "装箱单",
+            "PACKING LIST",
+            "Container No. ONEU9001741",
+            "Seal No. SL9001741",
+            "Port of Loading SHANGHAI",
+            "Port of Discharge GDANSK",
+            "Total Packages 61",
+            "Total Cargo Wt 9479.14KGS",
+            "Total Meas 12.400",
+            "40HC"
+          ]
+        },
+        {
+          "filename": "scan_b_006.jpeg",
+          "material_id": "freight_invoice",
+          "text": [
+            "电子发票",
+            "发票号码 9001724102",
+            "国际货运代理费",
+            "港口码头费",
+            "汇利达欧海国际货运代理",
+            "B/L No. SEAWB90017241",
+            "2026-04-08"
+          ]
+        }
+      ],
+      "purchase_contracts": [
+        "采购合同-工厂D-90017241.jpg"
+      ]
+    },
+    {
+      "id": "real_set_c_many_factory_contracts",
+      "invoice_no": "LY90017267",
+      "declaration_no": "910120260000000003",
+      "ledger": {
+        "发票号": "LY90017267",
+        "金额": 1705.44,
+        "目的国": "德国",
+        "出运日期": "2026-01-26"
+      },
+      "files": [
+        {
+          "filename": "scan_c_001.pdf",
+          "material_id": "export_sales",
+          "text": [
+            "PROFORMA INVOICE",
+            "Invoice No. 90017267",
+            "JIAXING LAYO IMPORT & EXPORT GROUP CO.,LTD.",
+            "Transport details",
+            "Terms of payment",
+            "Description of goods",
+            "Destination GERMANY",
+            "USD 1705.44",
+            "Date 2026-01-16"
+          ]
+        },
+        {
+          "filename": "scan_c_002.pdf",
+          "material_id": "customs_power_of_attorney",
+          "text": [
+            "报关委托书",
+            "代理报关委托",
+            "报关单编号 910120260000000003",
+            "一般贸易",
+            "177FREAL90017267"
+          ]
+        },
+        {
+          "filename": "scan_c_003.pdf",
+          "material_id": "customs_fee_invoice",
+          "text": [
+            "电子发票",
+            "发票号码 9001726701",
+            "国内货物运输代理服务",
+            "报关",
+            "嘉兴新锴国际货运代理",
+            "177FREAL90017267"
+          ]
+        },
+        {
+          "filename": "scan_c_004.pdf",
+          "material_id": "bill_of_lading",
+          "text": [
+            "ORIGINAL",
+            "Ocean or Combined Transport Bill of Lading",
+            "SHIPPER / EXPORTER",
+            "CONSIGNEE or ORDER",
+            "NOTIFY PARTY",
+            "B/L NUMBER CNSHASE90017267",
+            "PORT OF LOADING SHANGHAI",
+            "PORT OF DISCHARGE HAMBURG",
+            "PLACE OF DELIVERY HAMBURG",
+            "CNTR#OOCU9001767 / 40HC / SEAL#SL9001767 / 166 CARTONS / 1,705.440KGS / 14.491CBM",
+            "FREIGHT COLLECT",
+            "Carrier's standard terms and conditions are applicable to this bill of lading.",
+            "FMC Org. No. 026839",
+            "PLACE AND DATE OF ISSUE OF B/L SHANGHAI 26 Jan 2026"
+          ]
+        },
+        {
+          "filename": "scan_c_005.jpg",
+          "material_id": "packing_list",
+          "text": [
+            "CONTAINER LOAD PLAN",
+            "Container No. OOCU9001767",
+            "Seal No. SL9001767",
+            "Port of Loading SHANGHAI",
+            "Port of Discharge HAMBURG",
+            "Place of Delivery HAMBURG",
+            "Packing Date 2026-01-25",
+            "Total Packages 166",
+            "Total Cargo Wt 1705.44KGS",
+            "Total Meas 14.491",
+            "40HC",
+            "Bill of Lading No. 177FREAL90017267"
+          ]
+        },
+        {
+          "filename": "scan_c_006.png",
+          "material_id": "freight_invoice",
+          "text": [
+            "电子发票",
+            "发票号码 9001726702",
+            "国际货运代理费",
+            "港口码头费",
+            "汇利达欧海国际货运代理",
+            "B/L No. CNSHASE90017267",
+            "2026-02-07"
+          ]
+        }
+      ],
+      "purchase_contracts": [
+        "采购合同-工厂E-90017267.jpg",
+        "采购合同-工厂F-90017267.jpg",
+        "采购合同-工厂G-90017267.jpg",
+        "采购合同-工厂H-90017267.jpg",
+        "采购合同-工厂I-90017267.jpg",
+        "采购合同-工厂J-90017267.jpg"
+      ]
+    }
+  ]
+}

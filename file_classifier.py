@@ -792,7 +792,12 @@ def default_material_config() -> dict:
                     "any": [
                         "BILL OF LADING",
                         "OCEAN BILL OF LADING",
+                        "OCEAN OR COMBINED TRANSPORT BILL OF LADING",
                         "SEA WAYBILL",
+                        "BILLOFLADING",
+                        "Bill of Lading No.",
+                        "Number of Original B/L",
+                        "TELEX RELEASE",
                         "SHIPPER",
                         "CONSIGNEE",
                         "NOTIFY PARTY",
@@ -806,7 +811,12 @@ def default_material_config() -> dict:
                     "any": [
                         "BILL OF LADING",
                         "OCEAN BILL OF LADING",
+                        "OCEAN OR COMBINED TRANSPORT BILL OF LADING",
                         "SEA WAYBILL",
+                        "BILLOFLADING",
+                        "Bill of Lading No.",
+                        "Number of Original B/L",
+                        "TELEX RELEASE",
                         "SHIPPER",
                         "CONSIGNEE",
                         "NOTIFY PARTY",
@@ -873,6 +883,15 @@ def default_material_config() -> dict:
                     ],
                     "regex_any": [r"\b[A-Z]{4}\d{7}\b", r"\b[A-Z]{1,4}\d{5,10}\b", r"\b40H[QC]\b"],
                 },
+                "negative_patterns": [
+                    "OCEAN OR COMBINED TRANSPORT BILL OF LADING",
+                    "BILLOFLADING",
+                    "FREIGHT COLLECT",
+                    "SHIPPED ON BOARD",
+                    "TELEX RELEASE",
+                    "ORIGINAL B/L",
+                    "SHIPPER'S LOAD",
+                ],
             },
             {
                 "id": "freight_invoice",
@@ -949,7 +968,12 @@ def ensure_material_config(path: Path = DEFAULT_MATERIAL_CONFIG) -> dict:
     bill_any = [
         "BILL OF LADING",
         "OCEAN BILL OF LADING",
+        "OCEAN OR COMBINED TRANSPORT BILL OF LADING",
         "SEA WAYBILL",
+        "BILLOFLADING",
+        "Bill of Lading No.",
+        "Number of Original B/L",
+        "TELEX RELEASE",
         "SHIPPER",
         "CONSIGNEE",
         "NOTIFY PARTY",
@@ -981,6 +1005,15 @@ def ensure_material_config(path: Path = DEFAULT_MATERIAL_CONFIG) -> dict:
         "40HQ",
     ]
     packing_regex = [r"\b[A-Z]{4}\d{7}\b", r"\b[A-Z]{1,4}\d{5,10}\b", r"\b40H[QC]\b"]
+    packing_negative = [
+        "OCEAN OR COMBINED TRANSPORT BILL OF LADING",
+        "BILLOFLADING",
+        "FREIGHT COLLECT",
+        "SHIPPED ON BOARD",
+        "TELEX RELEASE",
+        "ORIGINAL B/L",
+        "SHIPPER'S LOAD",
+    ]
     freight_any = ["国际货运代理费", "港口码头费", "汇利达欧海国际货运代理"]
     freight_regex = [r"\b[A-Z]{5,8}\d{6,12}\b"]
 
@@ -1029,6 +1062,7 @@ def ensure_material_config(path: Path = DEFAULT_MATERIAL_CONFIG) -> dict:
                     regex_values=bill_regex,
                 ) or changed
         if material.get("id") == "packing_list":
+            changed = add_values(material.setdefault("negative_patterns", []), packing_negative) or changed
             for rules_key in ["pdf_text_rules", "ocr_text_rules"]:
                 changed = ensure_rules(
                     material,
@@ -3541,6 +3575,14 @@ def _e2e_write_dummy_files(folder: Path, filenames: list[str]) -> list[Path]:
     return paths
 
 
+def _e2e_purchase_contract_filenames(invoice_digits_value: str, count: int) -> list[str]:
+    factories = ["优尚", "莱尔特", "普沃特", "优创", "嘉结", "海泉", "凯艺美", "华鸣", "协作工厂A", "协作工厂B"]
+    return [
+        f"采购合同-{factories[index % len(factories)]}-{invoice_digits_value}-{index + 1:02d}.jpg"
+        for index in range(count)
+    ]
+
+
 def _e2e_split_marker_text(value: object) -> list[str]:
     if not value:
         return []
@@ -3595,7 +3637,7 @@ def _run_e2e_random_filename_case(
         "invoice_unknown.pdf",
     ]
     source_files = _e2e_write_dummy_files(incoming_dir, filenames)
-    source_files.extend(_e2e_write_dummy_files(source_root, ["合同-优尚-25117260.jpg"]))
+    source_files.extend(_e2e_write_dummy_files(source_root, _e2e_purchase_contract_filenames("25117260", 6)))
 
     processor = TaxRefundProcessor(
         str(output_root / "random_filenames"),

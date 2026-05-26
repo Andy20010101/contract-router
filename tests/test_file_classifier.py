@@ -23,6 +23,9 @@ except ModuleNotFoundError:
 import file_classifier as fc  # noqa: E402
 
 
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
 def patch_app_paths(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(fc, "SCRIPT_DIR", tmp_path)
     monkeypatch.setattr(fc, "DATA_DIR", tmp_path / "data")
@@ -199,6 +202,12 @@ def complete_material_texts():
     }
 
 
+def load_anonymized_real_material_sets():
+    data = json.loads((FIXTURE_DIR / "anonymized_real_material_sets.json").read_text(encoding="utf-8"))
+    assert data["schema"] == "contract-router-anonymized-material-fixtures/v1"
+    return data["sets"]
+
+
 def test_random_filenames_complete_package_is_matched_and_strong_closed_loop(monkeypatch, tmp_path):
     texts = complete_material_texts()
     folder = tmp_path / "output" / "LY25117260"
@@ -312,6 +321,188 @@ def test_end_to_end_incoming_random_files_move_classify_and_close_loop(monkeypat
     assert record["需人工确认文件"] == ""
     assert record["闭环冲突"] == ""
     assert "采购合同" not in record["缺少材料"]
+
+
+@pytest.mark.parametrize("contract_count", [1, 3, 6, 10])
+def test_same_invoice_accepts_variable_number_of_purchase_contracts(monkeypatch, tmp_path, contract_count):
+    texts = complete_material_texts()
+    folder = tmp_path / "output" / "LY25117260"
+    folder.mkdir(parents=True)
+    for filename in texts:
+        (folder / filename).write_bytes(b"dummy")
+    contract_filenames = [
+        f"采购合同-工厂{index + 1:02d}-25117260.jpg"
+        for index in range(contract_count)
+    ]
+    for filename in contract_filenames:
+        (folder / filename).write_bytes(b"contract")
+
+    matcher = fc.InvoiceMatcher(["LY25117260"])
+    assert all(matcher.match(filename) == "LY25117260" for filename in contract_filenames)
+
+    monkeypatch.setattr(fc, "pdf_text", lambda filepath, max_pages=2: texts.get(Path(filepath).name, ""))
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: texts.get(Path(filepath).name, ""))
+
+    processor = fc.TaxRefundProcessor(
+        str(tmp_path / "output"),
+        config_path=tmp_path / "materials_config.json",
+        ledger_records={
+            "LY25117260": {
+                "发票号": "LY25117260",
+                "金额": 100,
+                "目的国": "波兰",
+                "出运日期": "2026-05-20",
+            }
+        },
+    )
+
+    record = processor.evaluate_invoice(
+        "LY25117260",
+        str(folder),
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+    )
+
+    assert record["状态"] == "可改名"
+    assert record["缺少材料"] == ""
+    assert record["需人工确认文件"] == ""
+    assert record["重复材料"] == ""
+    assert record["闭环冲突"] == ""
+
+
+@pytest.mark.parametrize("fixture_set", load_anonymized_real_material_sets(), ids=lambda item: item["id"])
+def test_anonymized_real_material_sets_match_and_close_loop(monkeypatch, tmp_path, fixture_set):
+    folder = tmp_path / "output" / fixture_set["invoice_no"]
+    folder.mkdir(parents=True)
+    text_map = {}
+    for item in fixture_set["files"]:
+        path = folder / item["filename"]
+        path.write_bytes(b"desensitized fixture")
+        text_map[item["filename"]] = "\n".join(item["text"])
+    for filename in fixture_set["purchase_contracts"]:
+        (folder / filename).write_bytes(b"desensitized contract fixture")
+
+    monkeypatch.setattr(fc, "pdf_text", lambda filepath, max_pages=2: text_map.get(Path(filepath).name, ""))
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: text_map.get(Path(filepath).name, ""))
+
+    matcher = fc.InvoiceMatcher([fixture_set["invoice_no"]])
+    for filename in fixture_set["purchase_contracts"]:
+        assert matcher.match(filename) == fixture_set["invoice_no"]
+
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+    for item in fixture_set["files"]:
+        result = classifier.classify_file(str(folder / item["filename"]), fixture_set["invoice_no"])
+        assert result["status"] == "matched"
+        assert result["material_id"] == item["material_id"]
+    for filename in fixture_set["purchase_contracts"]:
+        result = classifier.classify_file(str(folder / filename), fixture_set["invoice_no"])
+        assert result["status"] == "matched"
+        assert result["material_id"] == "purchase_contract"
+
+    processor = fc.TaxRefundProcessor(
+        str(tmp_path / "output"),
+        config_path=tmp_path / "materials_config.json",
+        ledger_records={fixture_set["invoice_no"]: fixture_set["ledger"]},
+    )
+
+    record = processor.evaluate_invoice(
+        fixture_set["invoice_no"],
+        str(folder),
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+    )
+
+    assert record["状态"] == "可改名"
+    assert record["闭环状态"] == "强闭环通过"
+    assert record["报关号"] == fixture_set["declaration_no"]
+    assert record["缺少材料"] == ""
+    assert record["未识别文件"] == ""
+    assert record["需人工确认文件"] == ""
+    assert record["重复材料"] == ""
+    assert record["闭环冲突"] == ""
+    for material_name in ["外销", "报关委托书", "报关费发票", "提单", "装箱单", "运费发票"]:
+        assert material_name in record["已识别必需材料"]
+
+
+def test_anonymized_real_material_sets_route_from_random_incoming_names(monkeypatch, tmp_path):
+    fixture_sets = load_anonymized_real_material_sets()
+    ledger_records = {item["invoice_no"]: item["ledger"] for item in fixture_sets}
+    matcher = fc.InvoiceMatcher(list(ledger_records))
+    watch_dir = tmp_path / "watch"
+    output_dir = tmp_path / "output"
+    processor = fc.TaxRefundProcessor(
+        str(output_dir),
+        config_path=tmp_path / "materials_config.json",
+        ledger_records=ledger_records,
+    )
+
+    text_map = {}
+    expected_by_invoice = {}
+    source_files = []
+    random_stems = ["upload", "mobile", "scan", "doc", "capture", "paper"]
+    for set_index, fixture_set in enumerate(fixture_sets, start=1):
+        digits = fc.invoice_digits(fixture_set["invoice_no"])
+        incoming_dir = watch_dir / f"{digits} raw bundle"
+        incoming_dir.mkdir(parents=True)
+        expected_by_invoice[fixture_set["invoice_no"]] = []
+
+        for file_index, item in enumerate(fixture_set["files"], start=1):
+            suffix = Path(item["filename"]).suffix
+            random_name = f"{random_stems[file_index - 1]}_{set_index:02d}_{file_index:02d}{suffix}"
+            path = incoming_dir / random_name
+            path.write_bytes(b"desensitized fixture")
+            text_map[random_name] = "\n".join(item["text"])
+            expected_by_invoice[fixture_set["invoice_no"]].append(random_name)
+            source_files.append((path, fixture_set["invoice_no"]))
+
+        for contract_index, original_name in enumerate(fixture_set["purchase_contracts"], start=1):
+            suffix = Path(original_name).suffix
+            contract_name = f"采购合同-协作工厂{contract_index:02d}-{digits}{suffix}"
+            path = watch_dir / contract_name
+            path.write_bytes(b"desensitized contract fixture")
+            expected_by_invoice[fixture_set["invoice_no"]].append(contract_name)
+            source_files.append((path, fixture_set["invoice_no"]))
+
+    moved_by_invoice = {invoice_no: [] for invoice_no in ledger_records}
+    for source, expected_invoice in source_files:
+        success, _, _, dest_path, invoice_no, status = fc.move_file_to_output(
+            str(source),
+            str(output_dir),
+            matcher,
+            invoice_dir_resolver=processor.resolve_target_folder,
+            source_root=str(watch_dir),
+        )
+        assert success is True
+        assert status == "成功"
+        assert invoice_no == expected_invoice
+        assert Path(dest_path).parent == output_dir / expected_invoice
+        moved_by_invoice[invoice_no].append(Path(dest_path).name)
+
+    assert not (output_dir / fc.REVIEW_SUBFOLDER).exists()
+    for invoice_no, expected_names in expected_by_invoice.items():
+        assert sorted(moved_by_invoice[invoice_no]) == sorted(expected_names)
+
+    monkeypatch.setattr(fc, "pdf_text", lambda filepath, max_pages=2: text_map.get(Path(filepath).name, ""))
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: text_map.get(Path(filepath).name, ""))
+
+    for fixture_set in fixture_sets:
+        record = processor.evaluate_invoice(
+            fixture_set["invoice_no"],
+            str(output_dir / fixture_set["invoice_no"]),
+            allow_prompt=False,
+            allow_rename=False,
+            save_report=False,
+        )
+        assert record["状态"] == "可改名"
+        assert record["闭环状态"] == "强闭环通过"
+        assert record["报关号"] == fixture_set["declaration_no"]
+        assert record["缺少材料"] == ""
+        assert record["未识别文件"] == ""
+        assert record["需人工确认文件"] == ""
+        assert record["重复材料"] == ""
+        assert record["闭环冲突"] == ""
 
 
 def test_purchase_contract_filename_declaration_number_is_fallback(monkeypatch, tmp_path):
