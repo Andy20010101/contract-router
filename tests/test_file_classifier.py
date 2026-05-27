@@ -692,7 +692,8 @@ def test_resolve_target_folder_prefers_digits_folder_and_merges_full_invoice_fol
     target = processor.resolve_target_folder("LY25112915")
 
     assert Path(target) == digits_folder
-    assert not full_invoice_folder.exists()
+    assert full_invoice_folder.exists()
+    assert (full_invoice_folder / "提单.pdf").read_text(encoding="utf-8") == "bill"
     assert (digits_folder / "提单.pdf").read_text(encoding="utf-8") == "bill"
     assert (digits_folder / "外销.pdf").read_text(encoding="utf-8") == "existing"
     assert (digits_folder / "外销_重复1.pdf").read_text(encoding="utf-8") == "from full invoice folder"
@@ -712,10 +713,28 @@ def test_resolve_target_folder_uses_existing_ly_prefixed_child_folder(tmp_path):
     target = processor.resolve_target_folder("LY25112915")
 
     assert Path(target) == prefixed_folder
-    assert not exact_folder.exists()
+    assert exact_folder.exists()
+    assert (exact_folder / "提单.pdf").read_text(encoding="utf-8") == "bill"
     assert (prefixed_folder / "提单.pdf").read_text(encoding="utf-8") == "bill"
     assert (prefixed_folder / "外销.pdf").read_text(encoding="utf-8") == "existing"
     assert (prefixed_folder / "外销_重复1.pdf").read_text(encoding="utf-8") == "from exact folder"
+
+
+def test_resolve_target_folder_prefers_final_copy_without_merging_original(tmp_path):
+    output_dir = tmp_path / "output"
+    final_folder = output_dir / "123456789012345   25112915"
+    exact_folder = output_dir / "LY25112915"
+    final_folder.mkdir(parents=True)
+    exact_folder.mkdir()
+    (final_folder / "提单.pdf").write_text("standard copy", encoding="utf-8")
+    (exact_folder / "random.pdf").write_text("original", encoding="utf-8")
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    target = processor.resolve_target_folder("LY25112915")
+
+    assert Path(target) == final_folder
+    assert (exact_folder / "random.pdf").exists()
+    assert not (final_folder / "random.pdf").exists()
 
 
 def test_move_file_to_output_uses_existing_digits_folder(tmp_path):
@@ -948,6 +967,106 @@ def test_move_file_to_output_honors_stop_event_before_copying_file(tmp_path):
     assert dest_path == str(source)
     assert source.exists()
     assert not output_dir.exists()
+
+
+def test_move_file_to_output_dry_run_writes_plan_without_copying(tmp_path):
+    source = tmp_path / "watch" / "LY25112915 提单.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_text("bill", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    manifest = fc.OperationManifest(str(output_dir), dry_run=True, run_id="dry-run-test")
+
+    success, subfolder, message, dest_path, invoice_no, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        dry_run=True,
+        operation_manifest=manifest,
+    )
+
+    assert success is True
+    assert status == fc.STATUS_PLANNED
+    assert invoice_no == "LY25112915"
+    assert subfolder == "LY25112915"
+    assert "预览复制" in message
+    assert not Path(dest_path).exists()
+    assert source.exists()
+
+    data = json.loads(Path(manifest.path).read_text(encoding="utf-8"))
+    assert data["dry_run"] is True
+    assert data["operations"][0]["status"] == "planned_copy"
+    assert data["operations"][0]["destination_path"] == str(Path(dest_path))
+
+
+def test_operation_manifest_undo_removes_only_copied_file(tmp_path):
+    source = tmp_path / "watch" / "LY25112915 提单.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_text("bill", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    manifest = fc.OperationManifest(str(output_dir), run_id="undo-test")
+
+    success, _, _, dest_path, _, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        operation_manifest=manifest,
+    )
+
+    assert success is True
+    assert status == "成功"
+    assert Path(dest_path).exists()
+
+    summary = fc.undo_operation_manifest(manifest.path)
+
+    assert summary["undone"] == 1
+    assert summary["errors"] == []
+    assert source.exists()
+    assert not Path(dest_path).exists()
+
+
+def test_copy_first_rename_creates_standard_copy_and_undo_leaves_original(tmp_path):
+    output_dir = tmp_path / "output"
+    source_folder = output_dir / "LY25112915"
+    source_folder.mkdir(parents=True)
+    source = source_folder / "random.pdf"
+    source.write_text("bill", encoding="utf-8")
+    manifest = fc.OperationManifest(str(output_dir), run_id="rename-copy-test")
+    processor = fc.TaxRefundProcessor(
+        str(output_dir),
+        config_path=tmp_path / "materials_config.json",
+        operation_manifest=manifest,
+    )
+    record = {
+        "发票号": "LY25112915",
+        "报关号": "123456789012345",
+        "当前文件夹": str(source_folder),
+        "最终文件夹": "",
+        "状态": "可改名",
+        "是否已改名": "否",
+        "备注": "",
+    }
+    classifications = [{
+        "status": "matched",
+        "material_id": "bill_of_lading",
+        "material_name": "提单",
+        "material": {"final_name": "提单"},
+        "path": str(source),
+        "filename": source.name,
+    }]
+
+    updated = processor._rename_complete_folder(record, classifications)
+
+    final_folder = Path(updated["最终文件夹"])
+    copied = final_folder / "提单.pdf"
+    assert updated["状态"] == "已生成改名副本"
+    assert source.exists()
+    assert copied.read_text(encoding="utf-8") == "bill"
+
+    summary = fc.undo_operation_manifest(manifest.path)
+
+    assert summary["errors"] == []
+    assert source.exists()
+    assert not copied.exists()
 
 
 def test_copy_invoice_folder_filters_non_tax_materials(tmp_path):
@@ -1293,7 +1412,7 @@ def test_file_handler_sync_failure_does_not_affect_processing(monkeypatch, tmp_p
         def resolve_target_folder(self, invoice_no):
             return str(dest.parent)
 
-        def process_invoice(self, invoice_no, folder_path, prompt_callback=None):
+        def process_invoice(self, invoice_no, folder_path, prompt_callback=None, allow_rename=True):
             return {
                 "发票号": invoice_no,
                 "当前文件夹": folder_path,

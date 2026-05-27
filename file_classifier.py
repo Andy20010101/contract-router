@@ -28,6 +28,7 @@ import tempfile
 import unicodedata
 import argparse
 import filecmp
+import hashlib
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -68,11 +69,16 @@ IGNORED_SUFFIXES = {
     ".tmp", ".temp", ".crdownload", ".part", ".download", ".swp", ".lock",
 }
 IGNORED_PREFIXES = ("~$", ".~lock")
-REPORT_PREFIXES = ("工作日志_", "判断报告_", "rename_manifest_")
+REPORT_PREFIXES = ("工作日志_", "判断报告_", "rename_manifest_", "operation_manifest_")
 IMAGE_OCR_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 ROUTABLE_MATERIAL_STATUSES = {"matched", "manual_review"}
 STATUS_SKIPPED = "跳过"
+STATUS_PLANNED = "预览"
 DEFAULT_DECLARATION_TIMEOUT_SECONDS = 60.0
+SAFE_BATCH_CONFIRM_LIMIT = 20
+OPERATION_MANIFEST_SCHEMA = "contract-router-operation-manifest/v1"
+OPERATION_MANIFEST_DIRNAME = "_操作日志"
+OPERATION_MANIFEST_PREFIX = "operation_manifest_"
 EXCEL_WRITE_LOCK = threading.Lock()
 
 
@@ -208,19 +214,346 @@ def files_have_same_content(first_path: str, second_path: str) -> bool:
         return False
 
 
-def merge_folder_contents(source_dir: str, target_dir: str) -> None:
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_state(path: str) -> dict:
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        return {
+            "size": os.path.getsize(path),
+            "sha256": file_sha256(path),
+        }
+    except OSError:
+        return {}
+
+
+def operation_manifest_dir(output_dir: str) -> str:
+    return os.path.join(output_dir, OPERATION_MANIFEST_DIRNAME)
+
+
+def operation_manifest_path(output_dir: str, run_id: str = "") -> str:
+    run_id = sanitize_folder_name(run_id) if run_id else datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(
+        operation_manifest_dir(output_dir),
+        f"{OPERATION_MANIFEST_PREFIX}{run_id}_{os.getpid()}.json",
+    )
+
+
+def list_operation_manifests(output_dir: str) -> list[str]:
+    folder = operation_manifest_dir(output_dir)
+    if not os.path.isdir(folder):
+        return []
+    paths = []
+    for name in os.listdir(folder):
+        if name.startswith(OPERATION_MANIFEST_PREFIX) and name.endswith(".json"):
+            paths.append(os.path.join(folder, name))
+    return sorted(paths, key=lambda item: os.path.getmtime(item), reverse=True)
+
+
+def latest_operation_manifest(output_dir: str) -> str:
+    manifests = list_operation_manifests(output_dir)
+    return manifests[0] if manifests else ""
+
+
+class OperationManifest:
+    def __init__(self, output_dir: str, dry_run: bool = False, run_id: str = "", path: str = ""):
+        self.output_dir = normalize_path(output_dir)
+        self.dry_run = bool(dry_run)
+        self.path = normalize_path(path or operation_manifest_path(self.output_dir, run_id))
+        self.lock = threading.Lock()
+        self.data = {
+            "schema": OPERATION_MANIFEST_SCHEMA,
+            "run_id": run_id or Path(self.path).stem.removeprefix(OPERATION_MANIFEST_PREFIX),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "output_dir": self.output_dir,
+            "dry_run": self.dry_run,
+            "operations": [],
+        }
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._save_locked()
+
+    def add(
+        self,
+        action: str,
+        source_path: str = "",
+        destination_path: str = "",
+        status: str = "",
+        invoice_no: str = "",
+        subfolder: str = "",
+        message: str = "",
+        extra: dict | None = None,
+    ) -> dict:
+        record = {
+            "id": f"{time.time_ns()}-{threading.get_ident()}",
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "action": action,
+            "status": status,
+            "source_path": normalize_path(source_path) if source_path else "",
+            "destination_path": normalize_path(destination_path) if destination_path else "",
+            "invoice_no": invoice_no,
+            "subfolder": subfolder,
+            "message": message,
+        }
+        if extra:
+            record.update(extra)
+        with self.lock:
+            self.data["operations"].append(record)
+            self._save_locked()
+        return record
+
+    def _save_locked(self) -> None:
+        tmp_path = f"{self.path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, self.path)
+
+
+def resolve_copy_destination(src_path: str, dest_path: str) -> tuple[str, bool]:
+    if not os.path.exists(dest_path):
+        return dest_path, False
+    if files_have_same_content(src_path, dest_path):
+        return dest_path, True
+
+    folder = os.path.dirname(dest_path)
+    stem = Path(dest_path).stem
+    suffix = Path(dest_path).suffix
+    counter = 1
+    while True:
+        candidate = os.path.join(folder, f"{stem}_重复{counter}{suffix}")
+        if os.path.exists(candidate):
+            if files_have_same_content(src_path, candidate):
+                return candidate, True
+            counter += 1
+            continue
+        return candidate, False
+
+
+def record_file_copy(
+    operation_manifest: OperationManifest | None,
+    action: str,
+    source_path: str,
+    destination_path: str,
+    status: str,
+    invoice_no: str = "",
+    subfolder: str = "",
+    message: str = "",
+    planned: bool = False,
+) -> None:
+    if not operation_manifest:
+        return
+    extra = {"planned": bool(planned)}
+    source_state = file_state(source_path)
+    destination_state = file_state(destination_path)
+    if source_state:
+        extra["source_state"] = source_state
+    if destination_state:
+        extra["destination_state"] = destination_state
+    operation_manifest.add(
+        action=action,
+        source_path=source_path,
+        destination_path=destination_path,
+        status=status,
+        invoice_no=invoice_no,
+        subfolder=subfolder,
+        message=message,
+        extra=extra,
+    )
+
+
+def copy_file_with_manifest(
+    src_path: str,
+    dest_path: str,
+    operation_manifest: OperationManifest | None = None,
+    action: str = "copy_file",
+    invoice_no: str = "",
+    subfolder: str = "",
+    message: str = "",
+    dry_run: bool = False,
+) -> tuple[str, bool]:
+    dest_path, reused = resolve_copy_destination(src_path, dest_path)
+    status = "planned_reuse" if dry_run and reused else "planned_copy" if dry_run else "reused" if reused else "copied"
+    if dry_run:
+        record_file_copy(
+            operation_manifest,
+            action,
+            src_path,
+            dest_path,
+            status,
+            invoice_no=invoice_no,
+            subfolder=subfolder,
+            message=message,
+            planned=True,
+        )
+        return dest_path, reused
+    if not reused:
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        shutil.copy2(src_path, dest_path)
+    record_file_copy(
+        operation_manifest,
+        action,
+        src_path,
+        dest_path,
+        status,
+        invoice_no=invoice_no,
+        subfolder=subfolder,
+        message=message,
+    )
+    return dest_path, reused
+
+
+def copy_folder_contents(
+    source_dir: str,
+    target_dir: str,
+    operation_manifest: OperationManifest | None = None,
+    action: str = "copy_folder_file",
+    dry_run: bool = False,
+) -> int:
     source_dir = normalize_path(source_dir)
     target_dir = normalize_path(target_dir)
-    if paths_equal(source_dir, target_dir) or not os.path.isdir(source_dir) or not os.path.isdir(target_dir):
-        return
+    if paths_equal(source_dir, target_dir) or not os.path.isdir(source_dir):
+        return 0
+    copied = 0
+    for root, _, files in os.walk(source_dir):
+        rel_root = os.path.relpath(root, source_dir)
+        dest_root = target_dir if rel_root == "." else os.path.join(target_dir, rel_root)
+        for filename in files:
+            src = os.path.join(root, filename)
+            dst = os.path.join(dest_root, filename)
+            dst, reused = copy_file_with_manifest(
+                src,
+                dst,
+                operation_manifest=operation_manifest,
+                action=action,
+                message=f"复制合并: {src} -> {dst}",
+                dry_run=dry_run,
+            )
+            if not reused:
+                copied += 1
+    return copied
 
-    for name in os.listdir(source_dir):
-        src = os.path.join(source_dir, name)
-        dst = os.path.join(target_dir, name)
-        if os.path.exists(dst):
-            dst = unique_path(dst)
-        shutil.move(src, dst)
-    os.rmdir(source_dir)
+
+def merge_folder_contents(source_dir: str, target_dir: str) -> None:
+    copy_folder_contents(source_dir, target_dir)
+
+
+def remove_empty_parents(path: str, stop_dir: str) -> None:
+    stop_dir = comparable_path(stop_dir)
+    current = os.path.dirname(normalize_path(path))
+    while current and comparable_path(current) != stop_dir:
+        try:
+            os.rmdir(current)
+        except OSError:
+            return
+        current = os.path.dirname(current)
+
+
+def undo_operation_manifest(manifest_path: str, dry_run: bool = False) -> dict:
+    manifest_path = normalize_path(manifest_path)
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    if manifest.get("schema") != OPERATION_MANIFEST_SCHEMA:
+        raise RuntimeError(f"不支持的操作清单格式：{manifest_path}")
+
+    output_dir = normalize_path(manifest.get("output_dir") or os.path.dirname(manifest_path))
+    summary = {
+        "manifest_path": manifest_path,
+        "dry_run": bool(dry_run),
+        "total": 0,
+        "undone": 0,
+        "skipped": 0,
+        "errors": [],
+        "details": [],
+    }
+    operations = manifest.get("operations", [])
+    if not isinstance(operations, list):
+        raise RuntimeError(f"操作清单损坏：{manifest_path}")
+
+    for operation in reversed(operations):
+        if not isinstance(operation, dict):
+            continue
+        summary["total"] += 1
+        action = operation.get("action", "")
+        status = operation.get("status", "")
+        src = operation.get("source_path", "")
+        dst = operation.get("destination_path", "")
+
+        try:
+            if status == "copied" and dst and action in {"copy_file", "copy_merge_file", "rename_copy_file"}:
+                if not os.path.exists(dst):
+                    summary["skipped"] += 1
+                    summary["details"].append(f"已不存在，跳过: {dst}")
+                    continue
+                if not os.path.isfile(dst):
+                    summary["skipped"] += 1
+                    summary["details"].append(f"不是文件复制记录，跳过: {dst}")
+                    continue
+                expected_state = operation.get("destination_state") or {}
+                current_state = file_state(dst)
+                if (
+                    expected_state.get("sha256")
+                    and current_state.get("sha256")
+                    and expected_state["sha256"] != current_state["sha256"]
+                ):
+                    summary["skipped"] += 1
+                    summary["details"].append(f"目标已被改动，跳过: {dst}")
+                    continue
+                if not dry_run:
+                    os.remove(dst)
+                    remove_empty_parents(dst, output_dir)
+                summary["undone"] += 1
+                summary["details"].append(f"删除已复制文件: {dst}")
+                continue
+
+            if action == "rename_file" and status == "renamed" and src and dst:
+                if not os.path.exists(dst):
+                    summary["skipped"] += 1
+                    summary["details"].append(f"改名后文件不存在，跳过: {dst}")
+                    continue
+                if os.path.exists(src):
+                    summary["skipped"] += 1
+                    summary["details"].append(f"原路径已有文件，跳过回退: {src}")
+                    continue
+                if not dry_run:
+                    os.makedirs(os.path.dirname(src), exist_ok=True)
+                    os.rename(dst, src)
+                summary["undone"] += 1
+                summary["details"].append(f"回退文件改名: {dst} -> {src}")
+                continue
+
+            if action == "rename_folder" and status == "renamed" and src and dst:
+                if not os.path.isdir(dst):
+                    summary["skipped"] += 1
+                    summary["details"].append(f"改名后文件夹不存在，跳过: {dst}")
+                    continue
+                if os.path.exists(src):
+                    summary["skipped"] += 1
+                    summary["details"].append(f"原文件夹仍存在，跳过回退: {src}")
+                    continue
+                if not dry_run:
+                    os.rename(dst, src)
+                summary["undone"] += 1
+                summary["details"].append(f"回退文件夹改名: {dst} -> {src}")
+                continue
+
+            summary["skipped"] += 1
+        except Exception as exc:
+            summary["errors"].append(f"{action or 'operation'}: {exc}")
+
+    return summary
+
+
+def undo_latest_operation_manifest(output_dir: str, dry_run: bool = False) -> dict:
+    manifest_path = latest_operation_manifest(output_dir)
+    if not manifest_path:
+        raise FileNotFoundError(f"没有找到可撤销的操作清单：{operation_manifest_dir(output_dir)}")
+    return undo_operation_manifest(manifest_path, dry_run=dry_run)
 
 
 def normalize_unicode_text(value: str) -> str:
@@ -690,10 +1023,13 @@ def move_file_to_output(
     output_dir: str,
     invoice_matcher: InvoiceMatcher,
     invoice_dir_resolver=None,
+    invoice_dir_planner=None,
     source_root: str = "",
     material_classifier=None,
     unmatched_action: str = "review",
     stop_event: threading.Event = None,
+    dry_run: bool = False,
+    operation_manifest: OperationManifest | None = None,
 ) -> tuple:
     """
     将文件复制到输出目录的发票号子文件夹。
@@ -753,9 +1089,12 @@ def move_file_to_output(
             return True, "", f"监控已停止，已取消处理: {filename}", src_path, invoice_no, STATUS_SKIPPED
 
     subfolder_name = sanitize_folder_name(invoice_no if matched else REVIEW_SUBFOLDER)
+    resolver = invoice_dir_resolver
+    if dry_run and invoice_dir_planner:
+        resolver = invoice_dir_planner
     dest_dir = (
-        invoice_dir_resolver(invoice_no)
-        if matched and invoice_dir_resolver
+        resolver(invoice_no)
+        if matched and resolver
         else os.path.join(output_dir, subfolder_name)
     )
     actual_subfolder_name = os.path.basename(os.path.normpath(dest_dir)) if matched else subfolder_name
@@ -763,39 +1102,105 @@ def move_file_to_output(
     try:
         if stop_event and stop_event.is_set():
             return True, "", f"监控已停止，已取消处理: {filename}", src_path, invoice_no, STATUS_SKIPPED
-        os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, filename)
 
-        if os.path.exists(dest_path):
-            if files_have_same_content(src_path, dest_path):
-                if matched:
-                    return (
-                        True,
-                        actual_subfolder_name,
-                        f"目标已存在，已复用: {filename} → {actual_subfolder_name}/",
-                        dest_path,
-                        invoice_no,
-                        "成功",
-                    )
-                return (
-                    True,
-                    subfolder_name,
-                    f"未匹配发票号，人工复核中已存在相同文件: {filename} → {subfolder_name}/",
-                    dest_path,
-                    invoice_no,
-                    "未匹配",
+        dest_path, reused = resolve_copy_destination(src_path, dest_path)
+        if dry_run:
+            if matched:
+                msg = (
+                    f"预览复用: {filename} → {actual_subfolder_name}/"
+                    if reused
+                    else f"预览复制: {filename} → {actual_subfolder_name}/"
                 )
-            dest_path = unique_path(dest_path)
+                record_file_copy(
+                    operation_manifest,
+                    "copy_file",
+                    src_path,
+                    dest_path,
+                    "planned_reuse" if reused else "planned_copy",
+                    invoice_no=invoice_no,
+                    subfolder=actual_subfolder_name,
+                    message=msg,
+                    planned=True,
+                )
+                return True, actual_subfolder_name, msg, dest_path, invoice_no, STATUS_PLANNED
+            msg = (
+                f"预览复用到人工复核: {filename} → {subfolder_name}/"
+                if reused
+                else f"预览复制到人工复核: {filename} → {subfolder_name}/"
+            )
+            record_file_copy(
+                operation_manifest,
+                "copy_file",
+                src_path,
+                dest_path,
+                "planned_reuse" if reused else "planned_copy",
+                invoice_no=invoice_no,
+                subfolder=subfolder_name,
+                message=msg,
+                planned=True,
+            )
+            return True, subfolder_name, msg, dest_path, invoice_no, STATUS_PLANNED
+
+        if reused:
+            if matched:
+                msg = f"目标已存在，已复用: {filename} → {actual_subfolder_name}/"
+                record_file_copy(
+                    operation_manifest,
+                    "copy_file",
+                    src_path,
+                    dest_path,
+                    "reused",
+                    invoice_no=invoice_no,
+                    subfolder=actual_subfolder_name,
+                    message=msg,
+                )
+                return True, actual_subfolder_name, msg, dest_path, invoice_no, "成功"
+            msg = f"未匹配发票号，人工复核中已存在相同文件: {filename} → {subfolder_name}/"
+            record_file_copy(
+                operation_manifest,
+                "copy_file",
+                src_path,
+                dest_path,
+                "reused",
+                invoice_no=invoice_no,
+                subfolder=subfolder_name,
+                message=msg,
+            )
+            return True, subfolder_name, msg, dest_path, invoice_no, "未匹配"
 
         if stop_event and stop_event.is_set():
             return True, "", f"监控已停止，已取消处理: {filename}", src_path, invoice_no, STATUS_SKIPPED
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         shutil.copy2(src_path, dest_path)
         if matched:
-            return True, actual_subfolder_name, f"成功复制: {filename} → {actual_subfolder_name}/", dest_path, invoice_no, "成功"
+            msg = f"成功复制: {filename} → {actual_subfolder_name}/"
+            record_file_copy(
+                operation_manifest,
+                "copy_file",
+                src_path,
+                dest_path,
+                "copied",
+                invoice_no=invoice_no,
+                subfolder=actual_subfolder_name,
+                message=msg,
+            )
+            return True, actual_subfolder_name, msg, dest_path, invoice_no, "成功"
+        msg = f"未匹配发票号，已复制到人工复核: {filename} → {subfolder_name}/"
+        record_file_copy(
+            operation_manifest,
+            "copy_file",
+            src_path,
+            dest_path,
+            "copied",
+            invoice_no=invoice_no,
+            subfolder=subfolder_name,
+            message=msg,
+        )
         return (
             True,
             subfolder_name,
-            f"未匹配发票号，已复制到人工复核: {filename} → {subfolder_name}/",
+            msg,
             dest_path,
             invoice_no,
             "未匹配",
@@ -1964,37 +2369,86 @@ def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: 
 
 
 class TaxRefundProcessor:
-    def __init__(self, output_dir: str, config_path: Path = DEFAULT_MATERIAL_CONFIG, ledger_records: dict = None):
+    def __init__(
+        self,
+        output_dir: str,
+        config_path: Path = DEFAULT_MATERIAL_CONFIG,
+        ledger_records: dict = None,
+        dry_run: bool = False,
+        operation_manifest: OperationManifest | None = None,
+        copy_first_rename: bool = True,
+    ):
         self.output_dir = output_dir
         self.config_path = config_path
         self.config = ensure_material_config(config_path)
         self.classifier = MaterialClassifier(self.config)
         self.ledger_records = ledger_records or {}
+        self.dry_run = bool(dry_run)
+        self.operation_manifest = operation_manifest
+        self.copy_first_rename = bool(copy_first_rename)
         self.lock = threading.Lock()
         self.declaration_path = os.path.join(output_dir, "declaration_overrides.json")
         self.declarations = self._load_declarations()
 
-    def resolve_target_folder(self, invoice_no: str) -> str:
-        os.makedirs(self.output_dir, exist_ok=True)
+    def plan_target_folder(self, invoice_no: str) -> str:
+        return self._target_folder_for_invoice(invoice_no, allow_copy_merge=False)
+
+    def resolve_target_folder(self, invoice_no: str, allow_copy_merge: bool = True) -> str:
+        if not self.dry_run:
+            os.makedirs(self.output_dir, exist_ok=True)
+        return self._target_folder_for_invoice(invoice_no, allow_copy_merge=allow_copy_merge)
+
+    def _target_folder_for_invoice(self, invoice_no: str, allow_copy_merge: bool = True) -> str:
         original = os.path.join(self.output_dir, sanitize_folder_name(invoice_no))
+
+        final_like_folder = self._find_invoice_suffix_folder(invoice_no)
+        if final_like_folder:
+            return final_like_folder
 
         digits = invoice_digits(invoice_no)
         if digits:
             digits_folder = os.path.join(self.output_dir, sanitize_folder_name(digits))
             if os.path.isdir(digits_folder):
-                if os.path.isdir(original):
-                    merge_folder_contents(original, digits_folder)
+                self._copy_merge_original_folder(original, digits_folder, allow_copy_merge)
                 return digits_folder
 
         prefixed_folder = self._find_prefixed_invoice_folder(invoice_no)
         if prefixed_folder:
-            if os.path.isdir(original) and not paths_equal(original, prefixed_folder):
-                merge_folder_contents(original, prefixed_folder)
+            self._copy_merge_original_folder(original, prefixed_folder, allow_copy_merge)
             return prefixed_folder
 
         if os.path.isdir(original):
             return original
 
+        return original
+
+    def _copy_merge_original_folder(self, original: str, target: str, allow_copy_merge: bool) -> None:
+        if (
+            allow_copy_merge
+            and os.path.isdir(original)
+            and os.path.isdir(target)
+            and not paths_equal(original, target)
+        ):
+            copied = copy_folder_contents(
+                original,
+                target,
+                operation_manifest=self.operation_manifest,
+                action="copy_merge_file",
+                dry_run=self.dry_run,
+            )
+            if self.operation_manifest and copied:
+                self.operation_manifest.add(
+                    action="copy_merge_folder",
+                    source_path=original,
+                    destination_path=target,
+                    status="planned_copy" if self.dry_run else "copied",
+                    message="复制合并已有发票文件夹，原文件夹保留",
+                    extra={"planned": self.dry_run, "copied_files": copied},
+                )
+
+    def _find_invoice_suffix_folder(self, invoice_no: str) -> str:
+        if not os.path.isdir(self.output_dir):
+            return ""
         display = self.invoice_display(invoice_no)
         separator = self.config.get("folder_name", {}).get("separator", "   ")
         suffix = f"{separator}{display}"
@@ -2002,7 +2456,7 @@ class TaxRefundProcessor:
         for entry in os.scandir(self.output_dir):
             if entry.is_dir() and suffix_pattern.search(entry.name):
                 return entry.path
-        return original
+        return ""
 
     def _find_prefixed_invoice_folder(self, invoice_no: str) -> str:
         prefix = sanitize_folder_name(invoice_no)
@@ -2095,23 +2549,35 @@ class TaxRefundProcessor:
                 self._save_report_record(record)
             return record
 
-    def process_invoice(self, invoice_no: str, folder_path: str, prompt_callback=None) -> dict:
+    def process_invoice(
+        self,
+        invoice_no: str,
+        folder_path: str,
+        prompt_callback=None,
+        allow_rename: bool = True,
+    ) -> dict:
         return self.evaluate_invoice(
             invoice_no,
             folder_path,
             allow_prompt=True,
-            allow_rename=True,
+            allow_rename=allow_rename,
             save_report=True,
             persist_declaration=True,
             prompt_callback=prompt_callback,
         )
 
-    def process_all_invoice_folders(self, invoice_numbers: list[str], prompt_callback=None, log_callback=None):
+    def process_all_invoice_folders(
+        self,
+        invoice_numbers: list[str],
+        prompt_callback=None,
+        log_callback=None,
+        allow_rename: bool = True,
+    ):
         for invoice_no in invoice_numbers:
             folder = self.resolve_target_folder(invoice_no)
             if not os.path.isdir(folder):
                 continue
-            record = self.process_invoice(invoice_no, folder, prompt_callback=prompt_callback)
+            record = self.process_invoice(invoice_no, folder, prompt_callback=prompt_callback, allow_rename=allow_rename)
             if record and log_callback:
                 log_callback(f"📋 判断报告: {invoice_no} | {record.get('状态', '')}")
 
@@ -2263,6 +2729,9 @@ class TaxRefundProcessor:
             "文件": [],
         }
 
+        if self.dry_run or self.copy_first_rename:
+            return self._copy_first_complete_folder(record, classifications, source_folder, final_folder)
+
         try:
             used_targets = set()
             for item in classifications:
@@ -2314,6 +2783,127 @@ class TaxRefundProcessor:
             record["备注"] = str(exc)
             logging.error(f"退税材料改名失败: {record['发票号']} | {exc}")
         return record
+
+    def _copy_first_complete_folder(
+        self,
+        record: dict,
+        classifications: list[dict],
+        source_folder: str,
+        final_folder: str,
+    ) -> dict:
+        try:
+            file_records = self._copy_first_rename_plan(record, classifications, source_folder, final_folder)
+            if self.dry_run:
+                for file_record in file_records:
+                    record_file_copy(
+                        self.operation_manifest,
+                        "rename_copy_file",
+                        file_record["source"],
+                        file_record["destination"],
+                        "planned_copy",
+                        invoice_no=record["发票号"],
+                        subfolder=os.path.basename(os.path.normpath(final_folder)),
+                        message="预览生成标准命名副本",
+                        planned=True,
+                    )
+                if self.operation_manifest:
+                    self.operation_manifest.add(
+                        action="rename_copy_folder",
+                        source_path=source_folder,
+                        destination_path=final_folder,
+                        status="planned_copy",
+                        invoice_no=record["发票号"],
+                        message="预览生成标准命名副本，原文件夹保留",
+                        extra={"planned": True, "file_count": len(file_records)},
+                    )
+                record["最终文件夹"] = final_folder
+                record["状态"] = "预览改名"
+                record["是否已改名"] = "否"
+                record["备注"] = "预览模式：未复制、未改名、未移动原文件夹"
+                return record
+
+            for file_record in file_records:
+                copy_file_with_manifest(
+                    file_record["source"],
+                    file_record["destination"],
+                    operation_manifest=self.operation_manifest,
+                    action="rename_copy_file",
+                    invoice_no=record["发票号"],
+                    subfolder=os.path.basename(os.path.normpath(final_folder)),
+                    message="生成标准命名副本",
+                )
+            if self.operation_manifest:
+                self.operation_manifest.add(
+                    action="rename_copy_folder",
+                    source_path=source_folder,
+                    destination_path=final_folder,
+                    status="copied",
+                    invoice_no=record["发票号"],
+                    message="已生成标准命名副本，原文件夹保留",
+                    extra={"planned": False, "file_count": len(file_records)},
+                )
+
+            record["当前文件夹"] = source_folder
+            record["最终文件夹"] = final_folder
+            record["状态"] = "已生成改名副本"
+            record["是否已改名"] = "否"
+            record["备注"] = "已按报关号和发票号生成标准命名副本，原文件夹未移动"
+        except Exception as exc:
+            record["状态"] = "改名失败"
+            record["备注"] = str(exc)
+            logging.error(f"退税材料生成改名副本失败: {record['发票号']} | {exc}")
+        return record
+
+    def _copy_first_rename_plan(
+        self,
+        record: dict,
+        classifications: list[dict],
+        source_folder: str,
+        final_folder: str,
+    ) -> list[dict]:
+        classification_by_path = {
+            comparable_path(item["path"]): item
+            for item in classifications
+            if item.get("path")
+        }
+        used_targets = set()
+        file_records = []
+
+        for name in sorted(os.listdir(source_folder)):
+            source_path = os.path.join(source_folder, name)
+            if not os.path.isfile(source_path) or should_ignore_file(source_path):
+                continue
+            item = classification_by_path.get(comparable_path(source_path))
+            target_name = name
+            material_name = ""
+            if item and item.get("status") == "matched":
+                target_name = self._target_filename(item, record["发票号"]) or name
+                material_name = item.get("material_name", "")
+            destination = self._reserve_copy_destination(
+                source_path,
+                os.path.join(final_folder, target_name),
+                used_targets,
+            )
+            file_records.append({
+                "source": source_path,
+                "destination": destination,
+                "material_name": material_name,
+            })
+        return file_records
+
+    def _reserve_copy_destination(self, source_path: str, destination: str, used_targets: set) -> str:
+        folder = os.path.dirname(destination)
+        stem = Path(destination).stem
+        suffix = Path(destination).suffix
+        counter = 0
+        while True:
+            candidate_base = destination if counter == 0 else os.path.join(folder, f"{stem}_重复{counter}{suffix}")
+            candidate, _ = resolve_copy_destination(source_path, candidate_base)
+            key = comparable_path(candidate)
+            if key not in used_targets:
+                used_targets.add(key)
+                return candidate
+            counter += 1
 
     def _target_filename(self, item: dict, invoice_no: str) -> str:
         suffix = Path(item["filename"]).suffix
@@ -3166,7 +3756,9 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                  log_callback, pending_set: set, tax_processor: TaxRefundProcessor = None,
                  declaration_prompt_callback=None, company_ledger_path: str = "",
                  finance_batch_name: str = "", ledger_sync_manager: CompanyLedgerSyncManager = None,
-                 watch_dir: str = "", stop_event: threading.Event = None):
+                 watch_dir: str = "", stop_event: threading.Event = None,
+                 dry_run: bool = False, operation_manifest: OperationManifest | None = None,
+                 auto_rename: bool = False):
         if Observer:
             super().__init__()
         self.output_dir = output_dir
@@ -3182,6 +3774,9 @@ class FileHandler(FileSystemEventHandler if Observer else object):
         self.ledger_sync_manager = ledger_sync_manager
         self.watch_dir = normalize_path(watch_dir) if watch_dir else ""
         self.stop_event = stop_event
+        self.dry_run = bool(dry_run)
+        self.operation_manifest = operation_manifest
+        self.auto_rename = bool(auto_rename)
         self._lock = threading.Lock()
 
     def on_closed(self, event):
@@ -3252,7 +3847,12 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                 self.output_dir,
                 self.invoice_matcher,
                 invoice_dir_resolver=(
-                    self.tax_processor.resolve_target_folder
+                    getattr(self.tax_processor, "resolve_target_folder", None)
+                    if self.tax_processor
+                    else None
+                ),
+                invoice_dir_planner=(
+                    getattr(self.tax_processor, "plan_target_folder", None)
                     if self.tax_processor
                     else None
                 ),
@@ -3260,10 +3860,15 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                 material_classifier=getattr(self.tax_processor, "classifier", None),
                 unmatched_action="skip",
                 stop_event=self.stop_event,
+                dry_run=self.dry_run,
+                operation_manifest=self.operation_manifest,
             )
             if success and status == "成功":
                 self.log_callback(f"✅ {msg}", processed=True)
                 self.log_callback(f"   复制路径: {filepath} -> {dest_path}")
+            elif success and status == STATUS_PLANNED:
+                self.log_callback(f"🧾 {msg}", processed=True)
+                self.log_callback(f"   计划路径: {filepath} -> {dest_path}")
             elif success and status == STATUS_SKIPPED:
                 self.log_callback(f"⏭ {msg}")
                 self.log_callback(f"   保留位置: {filepath}")
@@ -3296,6 +3901,7 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                     invoice_no,
                     os.path.dirname(dest_path),
                     prompt_callback=self.declaration_prompt_callback,
+                    allow_rename=self.auto_rename,
                 )
                 if record:
                     self.log_callback(
@@ -3338,6 +3944,8 @@ class App(tk.Tk):
         # 状态变量
         self.watch_dir = tk.StringVar()
         self.output_dir = tk.StringVar()
+        self.dry_run_var = tk.BooleanVar(value=True)
+        self.auto_rename_var = tk.BooleanVar(value=False)
         self.is_running = False
         self._is_stopping = False
         self._close_after_stop = False
@@ -3347,6 +3955,7 @@ class App(tk.Tk):
         self.invoice_matcher = None
         self.tax_processor = None
         self.ledger_sync_manager = None
+        self.operation_manifest = None
         self.stop_event = threading.Event()
         self.pending_set: set = set()
         self._log_queue: queue.Queue = queue.Queue()
@@ -3390,6 +3999,33 @@ class App(tk.Tk):
         self._folder_row(folder_frame, "输出主文件夹（归类后存放位置）：", self.output_dir,
                          self._choose_output, row=1)
 
+        safety_frame = tk.LabelFrame(
+            content, text="  安全选项  ",
+            font=("微软雅黑", 10, "bold"), bg="#F0F4F8",
+            fg="#2C3E50", padx=10, pady=6
+        )
+        safety_frame.pack(fill="x", pady=(0, 10))
+
+        tk.Checkbutton(
+            safety_frame,
+            text="预览模式：只生成计划，不复制、不改名",
+            variable=self.dry_run_var,
+            font=("微软雅黑", 10),
+            bg="#F0F4F8",
+            fg="#2C3E50",
+            activebackground="#F0F4F8",
+        ).pack(side="left", padx=(0, 18))
+
+        tk.Checkbutton(
+            safety_frame,
+            text="生成标准命名副本",
+            variable=self.auto_rename_var,
+            font=("微软雅黑", 10),
+            bg="#F0F4F8",
+            fg="#2C3E50",
+            activebackground="#F0F4F8",
+        ).pack(side="left")
+
         # 控制按钮区
         btn_frame = tk.Frame(content, bg="#F0F4F8")
         btn_frame.pack(fill="x", pady=(0, 10))
@@ -3417,6 +4053,14 @@ class App(tk.Tk):
             command=self._generate_finance_batch
         )
         self.btn_finance_batch.pack(side="left", padx=(0, 10))
+
+        self.btn_undo = tk.Button(
+            btn_frame, text="↩  撤销上次整理", font=("微软雅黑", 11, "bold"),
+            bg="#D35400", fg="white", activebackground="#A04000",
+            relief="flat", padx=14, pady=8, cursor="hand2",
+            command=self._undo_last_operations
+        )
+        self.btn_undo.pack(side="left", padx=(0, 10))
 
         self.btn_clear = tk.Button(
             btn_frame, text="🗑  清空日志", font=("微软雅黑", 11),
@@ -3460,7 +4104,7 @@ class App(tk.Tk):
 
         # 底部提示
         tip = tk.Label(
-            self, text="💡 提示：文件名需以发票号开头；发票号来自 data/公司系统出运统计发票号清单.xlsx；财务批次表请使用【生成财务批次包】按钮处理",
+            self, text="💡 默认预览模式不会改动文件；确认计划无误后取消勾选再执行。所有真实复制都会写入操作清单，可用【撤销上次整理】回退。",
             font=("微软雅黑", 9), bg="#D5E8D4", fg="#27AE60", pady=4
         )
         tip.pack(fill="x", side="bottom")
@@ -3499,6 +4143,72 @@ class App(tk.Tk):
         d = filedialog.askdirectory(title="选择输出主文件夹")
         if d:
             self.output_dir.set(d)
+
+    def _undo_last_operations(self):
+        if self.is_running or self._is_stopping:
+            messagebox.showwarning("提示", "请先停止监控，再执行撤销。")
+            return
+        output = self.output_dir.get().strip()
+        if not output or not os.path.isdir(output):
+            messagebox.showwarning("提示", "请先选择有效的输出主文件夹！")
+            return
+        manifest_path = latest_operation_manifest(normalize_path(output))
+        if not manifest_path:
+            messagebox.showinfo("提示", "没有找到可撤销的操作清单。")
+            return
+        if not messagebox.askyesno(
+            "确认撤销",
+            "将根据最近一次操作清单删除本程序复制生成的文件。\n"
+            "如果目标文件已被人工修改，会自动跳过。\n\n"
+            f"操作清单：\n{manifest_path}\n\n"
+            "确定继续吗？",
+        ):
+            return
+
+        self.btn_undo.config(state="disabled")
+        self._enqueue_log(f"↩ 开始撤销: {manifest_path}")
+
+        def worker():
+            try:
+                summary = undo_operation_manifest(manifest_path)
+                self._log_queue.put(("undo_done", summary))
+            except Exception as exc:
+                self._log_queue.put(("undo_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _count_candidate_files(self, watch: str, output: str, invoice_matcher: InvoiceMatcher) -> int:
+        count = 0
+        for root, _, files in os.walk(watch):
+            for filename in files:
+                filepath = normalize_path(os.path.join(root, filename))
+                if should_ignore_file(filepath) or is_path_inside(filepath, output):
+                    continue
+                if invoice_matcher.match_path(filepath, source_root=watch):
+                    count += 1
+        return count
+
+    def _confirm_real_run(self, candidate_count: int) -> bool:
+        if self.dry_run_var.get():
+            return True
+        auto_rename_text = (
+            "\n已启用【生成标准命名副本】，不会移动原文件夹，但会复制生成新文件夹。"
+            if self.auto_rename_var.get()
+            else ""
+        )
+        if candidate_count > SAFE_BATCH_CONFIRM_LIMIT:
+            value = simpledialog.askstring(
+                "二次确认",
+                f"当前将真实复制 {candidate_count} 个已有文件，超过安全阈值 {SAFE_BATCH_CONFIRM_LIMIT}。"
+                f"{auto_rename_text}\n\n如确认执行，请输入：确认执行",
+                parent=self,
+            )
+            return (value or "").strip() == "确认执行"
+        return messagebox.askyesno(
+            "确认执行",
+            f"当前不是预览模式，将真实复制 {candidate_count} 个已有文件。"
+            f"{auto_rename_text}\n\n确认继续吗？",
+        )
 
     def _generate_finance_batch(self):
         if self._finance_batch_running:
@@ -3608,6 +4318,16 @@ class App(tk.Tk):
             messagebox.showwarning("提示", f"公司系统主台账没有可用发票号：\n{invoice_workbook}")
             return
 
+        preview_matcher = InvoiceMatcher(invoice_numbers)
+        existing_count = self._count_candidate_files(watch, output, preview_matcher)
+        if not self._confirm_real_run(existing_count):
+            return
+
+        dry_run = self.dry_run_var.get()
+        auto_rename = self.auto_rename_var.get()
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.operation_manifest = OperationManifest(output, dry_run=dry_run, run_id=run_id)
+
         self.is_running = True
         self._is_stopping = False
         self._close_after_stop = False
@@ -3623,9 +4343,14 @@ class App(tk.Tk):
 
         # 创建 Excel 日志管理器
         self.excel_logger = ExcelLogger(output)
-        self.invoice_matcher = InvoiceMatcher(invoice_numbers)
+        self.invoice_matcher = preview_matcher
         try:
-            self.tax_processor = TaxRefundProcessor(output, ledger_records=invoice_records)
+            self.tax_processor = TaxRefundProcessor(
+                output,
+                ledger_records=invoice_records,
+                dry_run=dry_run,
+                operation_manifest=self.operation_manifest,
+            )
         except Exception as exc:
             messagebox.showerror("退税材料配置读取失败", str(exc))
             self.executor.shutdown(wait=False, cancel_futures=True)
@@ -3654,18 +4379,26 @@ class App(tk.Tk):
             ledger_sync_manager=self.ledger_sync_manager,
             watch_dir=watch,
             stop_event=self.stop_event,
+            dry_run=dry_run,
+            operation_manifest=self.operation_manifest,
+            auto_rename=auto_rename,
         )
 
         self.observer = Observer()
         self.observer.schedule(handler, watch, recursive=True)
         self.observer.start()
-        existing_count = self._scan_existing_files(watch, handler)
+        submitted_count = self._scan_existing_files(watch, handler)
 
         self._enqueue_log(f"🚀 开始监控: {watch}")
         self._enqueue_log(f"📂 输出目录: {output}")
+        self._enqueue_log(f"🧾 操作清单: {self.operation_manifest.path}")
+        if dry_run:
+            self._enqueue_log("🧾 当前为预览模式：不会复制、改名或移动文件")
+        else:
+            self._enqueue_log("⚠ 当前为真实执行模式：所有复制都会写入操作清单，可撤销")
         self._enqueue_log(f"📒 发票号清单: {invoice_workbook}（{len(invoice_numbers)} 个发票号）")
         self._enqueue_log(f"📋 退税材料规则: {DEFAULT_MATERIAL_CONFIG}")
-        self._enqueue_log(f"🔁 已启用递归监听；启动时已提交 {existing_count} 个已有文件")
+        self._enqueue_log(f"🔁 已启用递归监听；启动时已提交 {submitted_count} 个已有文件")
         self._enqueue_log("─" * 60)
 
         self.executor.submit(
@@ -3673,6 +4406,7 @@ class App(tk.Tk):
             invoice_numbers,
             self._request_declaration_no,
             self._enqueue_log,
+            auto_rename,
         )
 
         self.btn_start.config(state="disabled")
@@ -3755,6 +4489,7 @@ class App(tk.Tk):
         self._write_log_line(f"⏹ 已停止监控。本次共处理 {self._processed_count} 个文件。")
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
+        self.btn_undo.config(state="normal")
         self.status_var.set("⚫ 已停止")
 
         if self._close_after_stop:
@@ -3819,6 +4554,27 @@ class App(tk.Tk):
                     continue
                 if isinstance(item, tuple) and item and item[0] == "finance_batch_error":
                     self._finish_finance_batch_error(item[1])
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "undo_done":
+                    summary = item[1]
+                    self.btn_undo.config(state="normal")
+                    self._write_log_line(
+                        f"↩ 撤销完成：已回退 {summary.get('undone', 0)} 项，"
+                        f"跳过 {summary.get('skipped', 0)} 项，错误 {len(summary.get('errors', []))} 项"
+                    )
+                    if summary.get("errors"):
+                        self._write_log_line("❌ 撤销错误：" + "；".join(summary["errors"]))
+                    messagebox.showinfo(
+                        "撤销完成",
+                        f"已回退：{summary.get('undone', 0)} 项\n"
+                        f"已跳过：{summary.get('skipped', 0)} 项\n"
+                        f"错误：{len(summary.get('errors', []))} 项",
+                    )
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "undo_error":
+                    self.btn_undo.config(state="normal")
+                    self._write_log_line(f"❌ 撤销失败: {item[1]}")
+                    messagebox.showerror("撤销失败", item[1])
                     continue
                 if isinstance(item, tuple) and item and item[0] == "prompt_declaration":
                     payload = item[1]
@@ -4422,10 +5178,25 @@ def main(argv: list[str] | None = None) -> int:
     e2e_parser.add_argument("--output", required=True, help="E2E output directory.")
     e2e_parser.add_argument("--report", required=True, help="Machine-readable report.json path.")
     e2e_parser.add_argument("--log", help="Optional E2E log path.")
+    undo_parser = subparsers.add_parser("undo", help="Undo copied files from an operation manifest.")
+    undo_parser.add_argument("--output", required=True, help="Output directory containing _操作日志.")
+    undo_parser.add_argument("--manifest", help="Specific operation_manifest_*.json to undo. Defaults to latest.")
+    undo_parser.add_argument("--dry-run", action="store_true", help="Preview undo without deleting files.")
 
     args = parser.parse_args(argv)
     if args.command == "e2e":
         return run_contract_router_e2e(args.input, args.output, args.report, args.log)
+    if args.command == "undo":
+        manifest_path = args.manifest or latest_operation_manifest(args.output)
+        if not manifest_path:
+            print(f"没有找到操作清单：{operation_manifest_dir(args.output)}", file=sys.stderr)
+            return 1
+        summary = undo_operation_manifest(manifest_path, dry_run=args.dry_run)
+        print(f"manifest={summary['manifest_path']}")
+        print(f"undone={summary['undone']} skipped={summary['skipped']} errors={len(summary['errors'])}")
+        for error in summary["errors"]:
+            print(f"error={error}", file=sys.stderr)
+        return 0 if not summary["errors"] else 1
     parser.error("unknown command")
     return 2
 
@@ -4463,7 +5234,7 @@ def check_and_install_deps():
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] in {"e2e", "-h", "--help"}:
+    if len(sys.argv) > 1 and sys.argv[1] in {"e2e", "undo", "-h", "--help"}:
         sys.exit(main(sys.argv[1:]))
 
     check_and_install_deps()
