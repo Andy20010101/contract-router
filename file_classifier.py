@@ -68,6 +68,9 @@ IGNORED_SUFFIXES = {
 }
 IGNORED_PREFIXES = ("~$", ".~lock")
 REPORT_PREFIXES = ("工作日志_", "判断报告_", "rename_manifest_")
+IMAGE_OCR_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+ROUTABLE_MATERIAL_STATUSES = {"matched", "manual_review"}
+STATUS_SKIPPED = "跳过"
 DEFAULT_DECLARATION_TIMEOUT_SECONDS = 60.0
 EXCEL_WRITE_LOCK = threading.Lock()
 
@@ -613,6 +616,7 @@ def wait_for_file_ready(
     timeout_seconds: float = 30.0,
     poll_interval: float = 1.0,
     stable_checks: int = 2,
+    stop_event: threading.Event = None,
 ) -> tuple[bool, str]:
     """等待文件大小连续稳定，并且能取得独占锁。"""
     deadline = time.monotonic() + timeout_seconds
@@ -621,6 +625,8 @@ def wait_for_file_ready(
     last_reason = "文件尚未稳定"
 
     while time.monotonic() <= deadline:
+        if stop_event and stop_event.is_set():
+            return False, "监控已停止"
         if not os.path.exists(filepath):
             return False, "文件不存在"
         if should_ignore_file(filepath):
@@ -649,7 +655,10 @@ def wait_for_file_ready(
 
         sleep_for = min(poll_interval, max(0, deadline - time.monotonic()))
         if sleep_for > 0:
-            time.sleep(sleep_for)
+            if stop_event:
+                stop_event.wait(sleep_for)
+            else:
+                time.sleep(sleep_for)
 
     return False, f"超过 {timeout_seconds:.0f} 秒仍未完成写入：{last_reason}"
 
@@ -670,14 +679,66 @@ def move_file_to_output(
     invoice_matcher: InvoiceMatcher,
     invoice_dir_resolver=None,
     source_root: str = "",
+    material_classifier=None,
+    unmatched_action: str = "review",
+    stop_event: threading.Event = None,
 ) -> tuple:
     """
     将文件剪切到输出目录的发票号子文件夹。
     返回 (success, subfolder, message, dest_path, invoice_no, status)
     """
     filename = os.path.basename(src_path)
+    if stop_event and stop_event.is_set():
+        return True, "", f"监控已停止，已取消处理: {filename}", src_path, "", STATUS_SKIPPED
+
     invoice_no = invoice_matcher.match_path(src_path, source_root=source_root)
     matched = bool(invoice_no)
+
+    if is_path_inside(src_path, output_dir):
+        return (
+            True,
+            "",
+            f"输出目录内文件，已跳过: {filename}",
+            src_path,
+            invoice_no,
+            STATUS_SKIPPED,
+        )
+
+    if not matched and unmatched_action == "skip":
+        return (
+            True,
+            "",
+            f"未匹配发票号，已跳过并保留原位置: {filename}",
+            src_path,
+            "",
+            STATUS_SKIPPED,
+        )
+
+    if matched and material_classifier:
+        try:
+            classification = material_classifier.classify_file(src_path, invoice_no)
+        except Exception as exc:
+            return (
+                True,
+                sanitize_folder_name(invoice_no),
+                f"材料识别失败，已跳过并保留原位置: {filename} | {exc}",
+                src_path,
+                invoice_no,
+                STATUS_SKIPPED,
+            )
+        if classification.get("status") not in ROUTABLE_MATERIAL_STATUSES:
+            material_hint = classification.get("material_name") or "未识别"
+            return (
+                True,
+                sanitize_folder_name(invoice_no),
+                f"非退税材料，已跳过并保留原位置: {filename} | 判断: {material_hint}",
+                src_path,
+                invoice_no,
+                STATUS_SKIPPED,
+            )
+        if stop_event and stop_event.is_set():
+            return True, "", f"监控已停止，已取消处理: {filename}", src_path, invoice_no, STATUS_SKIPPED
+
     subfolder_name = sanitize_folder_name(invoice_no if matched else REVIEW_SUBFOLDER)
     dest_dir = (
         invoice_dir_resolver(invoice_no)
@@ -687,12 +748,16 @@ def move_file_to_output(
     actual_subfolder_name = os.path.basename(os.path.normpath(dest_dir)) if matched else subfolder_name
 
     try:
+        if stop_event and stop_event.is_set():
+            return True, "", f"监控已停止，已取消处理: {filename}", src_path, invoice_no, STATUS_SKIPPED
         os.makedirs(dest_dir, exist_ok=True)
         dest_path = os.path.join(dest_dir, filename)
 
         if os.path.exists(dest_path):
             dest_path = unique_path(dest_path)
 
+        if stop_event and stop_event.is_set():
+            return True, "", f"监控已停止，已取消处理: {filename}", src_path, invoice_no, STATUS_SKIPPED
         shutil.move(src_path, dest_path)
         if matched:
             return True, actual_subfolder_name, f"成功: {filename} → {actual_subfolder_name}/", dest_path, invoice_no, "成功"
@@ -855,8 +920,36 @@ def default_material_config() -> dict:
                         "GDANSK",
                         "40HC",
                         "40HQ",
+                        "收货作业记录单",
+                        "收货凭证",
+                        "进仓编号",
+                        "来自地点",
+                        "送货车号",
+                        "客户名称",
+                        "司机号码",
+                        "登记件数",
+                        "包装类型",
+                        "总件数",
+                        "总体积",
+                        "总重量",
+                        "残损记录",
+                        "实收件数",
+                        "分票类型",
+                        "车辆类型",
+                        "换单员",
+                        "收货员",
+                        "库位",
+                        "唛头",
+                        "件数",
                     ],
-                    "regex_any": [r"\b[A-Z]{4}\d{7}\b", r"\b[A-Z]{1,4}\d{5,10}\b", r"\b40H[QC]\b"],
+                    "regex_any": [
+                        r"\b[A-Z]{4}\d{7}\b",
+                        r"\b[A-Z]{1,4}\d{5,10}\b",
+                        r"\b40H[QC]\b",
+                        r"\bJC\d{6,10}\b",
+                        r"\bL\d{7,}[A-Z0-9]*\b",
+                        r"[\u4e00-\u9fa5][A-Z][A-Z0-9]{5}\b",
+                    ],
                 },
                 "ocr_text_rules": {
                     "any": [
@@ -880,8 +973,36 @@ def default_material_config() -> dict:
                         "GDANSK",
                         "40HC",
                         "40HQ",
+                        "收货作业记录单",
+                        "收货凭证",
+                        "进仓编号",
+                        "来自地点",
+                        "送货车号",
+                        "客户名称",
+                        "司机号码",
+                        "登记件数",
+                        "包装类型",
+                        "总件数",
+                        "总体积",
+                        "总重量",
+                        "残损记录",
+                        "实收件数",
+                        "分票类型",
+                        "车辆类型",
+                        "换单员",
+                        "收货员",
+                        "库位",
+                        "唛头",
+                        "件数",
                     ],
-                    "regex_any": [r"\b[A-Z]{4}\d{7}\b", r"\b[A-Z]{1,4}\d{5,10}\b", r"\b40H[QC]\b"],
+                    "regex_any": [
+                        r"\b[A-Z]{4}\d{7}\b",
+                        r"\b[A-Z]{1,4}\d{5,10}\b",
+                        r"\b40H[QC]\b",
+                        r"\bJC\d{6,10}\b",
+                        r"\bL\d{7,}[A-Z0-9]*\b",
+                        r"[\u4e00-\u9fa5][A-Z][A-Z0-9]{5}\b",
+                    ],
                 },
                 "negative_patterns": [
                     "OCEAN OR COMBINED TRANSPORT BILL OF LADING",
@@ -1003,8 +1124,36 @@ def ensure_material_config(path: Path = DEFAULT_MATERIAL_CONFIG) -> dict:
         "GDANSK",
         "40HC",
         "40HQ",
+        "收货作业记录单",
+        "收货凭证",
+        "进仓编号",
+        "来自地点",
+        "送货车号",
+        "客户名称",
+        "司机号码",
+        "登记件数",
+        "包装类型",
+        "总件数",
+        "总体积",
+        "总重量",
+        "残损记录",
+        "实收件数",
+        "分票类型",
+        "车辆类型",
+        "换单员",
+        "收货员",
+        "库位",
+        "唛头",
+        "件数",
     ]
-    packing_regex = [r"\b[A-Z]{4}\d{7}\b", r"\b[A-Z]{1,4}\d{5,10}\b", r"\b40H[QC]\b"]
+    packing_regex = [
+        r"\b[A-Z]{4}\d{7}\b",
+        r"\b[A-Z]{1,4}\d{5,10}\b",
+        r"\b40H[QC]\b",
+        r"\bJC\d{6,10}\b",
+        r"\bL\d{7,}[A-Z0-9]*\b",
+        r"[\u4e00-\u9fa5][A-Z][A-Z0-9]{5}\b",
+    ]
     packing_negative = [
         "OCEAN OR COMBINED TRANSPORT BILL OF LADING",
         "BILLOFLADING",
@@ -1140,10 +1289,122 @@ def rapid_ocr_text(filepath: str) -> str:
     return "\n".join(str(item[1]) for item in result if len(item) >= 2)
 
 
+def _save_ocr_variant(image, variant_paths: list[str]) -> None:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        image.save(tmp_path, format="PNG")
+        variant_paths.append(tmp_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _resize_image_for_ocr(image):
+    width, height = image.size
+    long_side = max(width, height)
+    short_side = max(1, min(width, height))
+    scale = 1.0
+    if short_side < 1200:
+        scale = min(3.0, 1200 / short_side)
+    elif long_side < 2200:
+        scale = min(2.0, 2200 / long_side)
+    if scale <= 1.05:
+        return image.copy()
+
+    resampling = getattr(getattr(image, "Resampling", None), "LANCZOS", None)
+    if resampling is None:
+        try:
+            from PIL import Image
+            resampling = getattr(Image, "Resampling", Image).LANCZOS
+        except Exception:
+            resampling = 1
+    return image.resize((int(width * scale), int(height * scale)), resampling)
+
+
+def _create_preprocessed_image_variants(filepath: str) -> list[str]:
+    try:
+        from PIL import Image, ImageFilter, ImageOps
+    except Exception:
+        return []
+
+    variant_paths = []
+    try:
+        with Image.open(filepath) as original:
+            image = ImageOps.exif_transpose(original).convert("RGB")
+            gray = ImageOps.grayscale(image)
+            gray = ImageOps.autocontrast(gray, cutoff=1)
+            gray = _resize_image_for_ocr(gray)
+
+            _save_ocr_variant(gray, variant_paths)
+            _save_ocr_variant(gray.filter(ImageFilter.SHARPEN), variant_paths)
+
+            histogram = gray.histogram()
+            total = sum(histogram) or 1
+            mean = sum(index * count for index, count in enumerate(histogram)) / total
+            threshold = min(205, max(145, int(mean * 0.9)))
+            binary = gray.point(lambda pixel: 255 if pixel > threshold else 0).convert("L")
+            _save_ocr_variant(binary, variant_paths)
+
+            width, height = gray.size
+            if max(width, height) / max(1, min(width, height)) >= 1.25:
+                _save_ocr_variant(gray.rotate(90, expand=True), variant_paths)
+                _save_ocr_variant(gray.rotate(270, expand=True), variant_paths)
+    except Exception as exc:
+        logging.error(f"图片 OCR 预处理失败: {filepath} | {exc}")
+        for path in variant_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return []
+    return variant_paths
+
+
+def _merge_ocr_texts(texts: list[str]) -> str:
+    merged_lines = []
+    seen = set()
+    for text in texts:
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            key = normalize_text_for_match(stripped)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_lines.append(stripped)
+    return "\n".join(merged_lines).strip()
+
+
+def _ocr_image_text(filepath: str) -> str:
+    texts = []
+    temp_paths = []
+    try:
+        raw_text = rapid_ocr_text(filepath)
+        if raw_text:
+            texts.append(raw_text)
+        temp_paths = _create_preprocessed_image_variants(filepath)
+        for path in temp_paths:
+            text = rapid_ocr_text(path)
+            if text:
+                texts.append(text)
+    finally:
+        for path in temp_paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return _merge_ocr_texts(texts)
+
+
 def ocr_text(filepath: str, max_pdf_pages: int = 1) -> str:
     suffix = Path(filepath).suffix.lower()
-    if suffix in {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}:
-        return rapid_ocr_text(filepath)
+    if suffix in IMAGE_OCR_SUFFIXES:
+        return _ocr_image_text(filepath)
     if suffix != ".pdf":
         return ""
 
@@ -1162,7 +1423,7 @@ def ocr_text(filepath: str, max_pdf_pages: int = 1) -> str:
                     tmp_path = tmp.name
                 try:
                     pix.save(tmp_path)
-                    text = rapid_ocr_text(tmp_path)
+                    text = _ocr_image_text(tmp_path)
                     if text:
                         texts.append(text)
                 finally:
@@ -1410,12 +1671,56 @@ class MaterialClassifier:
             reasons.extend(ocr_reasons)
 
         text_for_negative = "\n".join(filter(None, [text_cache["pdf"] or "", text_cache["ocr"] or "", stripped_name]))
+        negative_hit = False
         for pattern in material.get("negative_patterns", []):
             if keyword_match(pattern, text_for_negative):
+                negative_hit = True
                 score -= 50
                 reasons.append(f"排除词命中:{pattern}")
 
+        if material.get("id") == "packing_list" and not negative_hit:
+            fallback_score, fallback_reasons = self._score_packing_list_ocr_fallback(
+                score,
+                reasons,
+                stripped_name,
+                text_cache["pdf"] or "",
+                text_cache["ocr"] or "",
+            )
+            score += fallback_score
+            reasons.extend(fallback_reasons)
+
         return max(score, 0), reasons
+
+    @staticmethod
+    def _score_packing_list_ocr_fallback(
+        score: int,
+        reasons: list[str],
+        stripped_name: str,
+        pdf_text_value: str,
+        ocr_text_value: str,
+    ) -> tuple[int, list[str]]:
+        if score < 25:
+            return 0, []
+        if not (keyword_match("装箱单", stripped_name) or keyword_match("箱单", stripped_name)):
+            return 0, []
+
+        source = "OCR" if ocr_text_value else "PDF"
+        text = normalize_document_text(ocr_text_value or pdf_text_value)
+        if len(text) < 80:
+            return 0, []
+
+        warehouse_signals = [
+            "收货", "进仓", "件数", "体积", "重量", "唛头", "库位", "车号",
+            "客户名称", "司机", "包装", "货物", "凭证", "作业记录",
+        ]
+        matched_signals = [signal for signal in warehouse_signals if keyword_match(signal, text)]
+        if len(matched_signals) >= 2:
+            return 30, [f"{source}仓库装箱字段组合命中:{','.join(matched_signals[:4])}"]
+
+        has_content_match = any(reason.startswith(("PDF", "OCR")) for reason in reasons)
+        if not has_content_match and score < 70 and len(text) >= 120:
+            return 30, [f"{source}文本可用:装箱单文件名兜底"]
+        return 0, []
 
     @staticmethod
     def _score_file_name(material: dict, stripped_name: str) -> tuple[int, list[str]]:
@@ -2152,9 +2457,16 @@ class ExcelLogger:
             ws_summary = wb.create_sheet("汇总统计")
 
         # ── 处理明细 Sheet ──
-        if ws_detail.max_row <= 1:
-            headers = ["序号", "文件名", "归入子文件夹", "处理时间", "状态"]
-            ws_detail.append(headers)
+        headers = ["序号", "文件名", "归入子文件夹", "处理时间", "状态", "源路径", "目标路径", "说明"]
+        first_row_has_values = any(cell.value for cell in ws_detail[1])
+        if ws_detail.max_row <= 1 and not first_row_has_values:
+            for col_idx, header in enumerate(headers, start=1):
+                ws_detail.cell(row=1, column=col_idx, value=header)
+            self._style_header(ws_detail, headers)
+        else:
+            for col_idx, header in enumerate(headers, start=1):
+                if not ws_detail.cell(row=1, column=col_idx).value:
+                    ws_detail.cell(row=1, column=col_idx, value=header)
             self._style_header(ws_detail, headers)
 
         start_row = ws_detail.max_row + 1
@@ -2165,10 +2477,13 @@ class ExcelLogger:
                 rec["归入子文件夹"],
                 rec["处理时间"],
                 rec["状态"],
+                rec.get("源路径", ""),
+                rec.get("目标路径", ""),
+                rec.get("说明", ""),
             ])
 
         # 设置列宽
-        col_widths = [8, 45, 20, 22, 40]
+        col_widths = [8, 45, 20, 22, 40, 65, 65, 70]
         for col_idx, width in enumerate(col_widths, start=1):
             ws_detail.column_dimensions[
                 openpyxl.utils.get_column_letter(col_idx)
@@ -2512,8 +2827,14 @@ def _find_equivalent_invoice_key(records: dict[str, dict], invoice_no: str) -> s
     return ""
 
 
-def copy_invoice_folder(source_folder: str, batch_output_dir: str, invoice_no: str, record: dict) -> str:
-    del invoice_no, record
+def copy_invoice_folder(
+    source_folder: str,
+    batch_output_dir: str,
+    invoice_no: str,
+    record: dict,
+    material_classifier=None,
+) -> str:
+    del record
     source_folder = normalize_path(source_folder)
     batch_output_dir = normalize_path(batch_output_dir)
     os.makedirs(batch_output_dir, exist_ok=True)
@@ -2529,6 +2850,15 @@ def copy_invoice_folder(source_folder: str, batch_output_dir: str, invoice_no: s
                 or should_ignore_file(path)
             ):
                 ignored.append(name)
+                continue
+            if material_classifier and os.path.isfile(path):
+                try:
+                    classification = material_classifier.classify_file(path, invoice_no)
+                except Exception:
+                    ignored.append(name)
+                    continue
+                if classification.get("status") not in ROUTABLE_MATERIAL_STATUSES:
+                    ignored.append(name)
         return ignored
 
     shutil.copytree(source_folder, target_folder, ignore=ignore_batch_irrelevant)
@@ -2602,7 +2932,13 @@ class FinanceBatchProcessor:
             )
             copied_folder = ""
             if folder_exists:
-                copied_folder = copy_invoice_folder(source_folder, batch_output_dir, eval_invoice, record)
+                copied_folder = copy_invoice_folder(
+                    source_folder,
+                    batch_output_dir,
+                    eval_invoice,
+                    record,
+                    material_classifier=self.tax_processor.classifier,
+                )
 
             tax_status = tax_status_from_record(record, in_ledger=in_ledger, folder_exists=folder_exists)
             remarks = [record.get("备注", "")]
@@ -2799,7 +3135,7 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                  log_callback, pending_set: set, tax_processor: TaxRefundProcessor = None,
                  declaration_prompt_callback=None, company_ledger_path: str = "",
                  finance_batch_name: str = "", ledger_sync_manager: CompanyLedgerSyncManager = None,
-                 watch_dir: str = ""):
+                 watch_dir: str = "", stop_event: threading.Event = None):
         if Observer:
             super().__init__()
         self.output_dir = output_dir
@@ -2814,6 +3150,7 @@ class FileHandler(FileSystemEventHandler if Observer else object):
         self.finance_batch_name = finance_batch_name
         self.ledger_sync_manager = ledger_sync_manager
         self.watch_dir = normalize_path(watch_dir) if watch_dir else ""
+        self.stop_event = stop_event
         self._lock = threading.Lock()
 
     def on_closed(self, event):
@@ -2830,9 +3167,15 @@ class FileHandler(FileSystemEventHandler if Observer else object):
             self._schedule(event.dest_path)
 
     def _schedule(self, filepath: str):
+        if self.stop_event and self.stop_event.is_set():
+            return False
         if should_ignore_file(filepath):
             return False
         filepath = normalize_path(filepath)
+        if is_path_inside(filepath, self.output_dir):
+            return False
+        if self.watch_dir and not self.invoice_matcher.match_path(filepath, source_root=self.watch_dir):
+            return False
         with self._lock:
             if filepath in self.pending_set:
                 return False
@@ -2848,13 +3191,18 @@ class FileHandler(FileSystemEventHandler if Observer else object):
     def _process(self, filepath: str):
         filename = os.path.basename(filepath)
         try:
+            if self.stop_event and self.stop_event.is_set():
+                return
             # 等待文件写入完成
             ready, reason = wait_for_file_ready(
                 filepath,
                 timeout_seconds=30.0,
                 poll_interval=1.0,
                 stable_checks=2,
+                stop_event=self.stop_event,
             )
+            if self.stop_event and self.stop_event.is_set():
+                return
             if not ready:
                 msg = f"文件未就绪，已放弃: {filename} | {reason}"
                 self.log_callback(f"⚠ {msg}")
@@ -2878,11 +3226,20 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                     else None
                 ),
                 source_root=self.watch_dir,
+                material_classifier=getattr(self.tax_processor, "classifier", None),
+                unmatched_action="skip",
+                stop_event=self.stop_event,
             )
             if success and status == "成功":
                 self.log_callback(f"✅ {msg}", processed=True)
+                self.log_callback(f"   路径: {filepath} -> {dest_path}")
+            elif success and status == STATUS_SKIPPED:
+                self.log_callback(f"⏭ {msg}")
+                self.log_callback(f"   保留位置: {filepath}")
             elif success:
                 self.log_callback(f"⚠ {msg}", processed=True)
+                if dest_path:
+                    self.log_callback(f"   路径: {filepath} -> {dest_path}")
             else:
                 self.log_callback(f"❌ {msg}")
             self.excel_logger.add_record(
@@ -2897,7 +3254,13 @@ class FileHandler(FileSystemEventHandler if Observer else object):
             # 每处理一个文件就保存一次日志（保证实时性）
             self.excel_logger.save()
 
-            if success and invoice_no and self.tax_processor:
+            if (
+                success
+                and status == "成功"
+                and invoice_no
+                and self.tax_processor
+                and not (self.stop_event and self.stop_event.is_set())
+            ):
                 record = self.tax_processor.process_invoice(
                     invoice_no,
                     os.path.dirname(dest_path),
@@ -2953,6 +3316,7 @@ class App(tk.Tk):
         self.invoice_matcher = None
         self.tax_processor = None
         self.ledger_sync_manager = None
+        self.stop_event = threading.Event()
         self.pending_set: set = set()
         self._log_queue: queue.Queue = queue.Queue()
         self._finance_batch_running = False
@@ -3219,6 +3583,7 @@ class App(tk.Tk):
         self._processed_count = 0
         self.stats_var.set("已处理文件：0 个")
         self.pending_set.clear()
+        self.stop_event = threading.Event()
         self.watch_dir.set(watch)
         self.output_dir.set(output)
 
@@ -3257,6 +3622,7 @@ class App(tk.Tk):
             finance_batch_name=settings.get("finance_batch", {}).get("last_batch_name", ""),
             ledger_sync_manager=self.ledger_sync_manager,
             watch_dir=watch,
+            stop_event=self.stop_event,
         )
 
         self.observer = Observer()
@@ -3298,11 +3664,13 @@ class App(tk.Tk):
             return
 
         self._is_stopping = True
+        if self.stop_event:
+            self.stop_event.set()
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="disabled")
         self.status_var.set("🟡 正在停止…")
         self._enqueue_log("─" * 60)
-        self._enqueue_log("⏳ 正在停止监控，等待已提交文件处理完成…")
+        self._enqueue_log("⏳ 正在停止监控，取消未开始任务并中止待处理文件…")
 
         observer = self.observer
         executor = self.executor
@@ -3323,9 +3691,9 @@ class App(tk.Tk):
 
             try:
                 if executor:
-                    executor.shutdown(wait=True, cancel_futures=False)
+                    executor.shutdown(wait=False, cancel_futures=True)
             except Exception as exc:
-                errors.append(f"等待处理线程结束失败: {exc}")
+                errors.append(f"取消处理线程失败: {exc}")
 
             try:
                 if excel_logger:

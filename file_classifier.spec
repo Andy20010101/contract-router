@@ -6,6 +6,7 @@ hiddenimports = (
     collect_submodules("rapidocr_onnxruntime")
     + collect_submodules("rapidocr")
     + collect_submodules("onnxruntime")
+    + collect_submodules("PIL")
 )
 
 a = Analysis(

@@ -134,6 +134,70 @@ def test_bill_of_lading_matches_scanned_ocr_text_without_filename_keyword(monkey
     assert result["material_id"] == "bill_of_lading"
 
 
+def test_image_ocr_uses_preprocessed_variants(monkeypatch, tmp_path):
+    image = tmp_path / "装箱单.jpg"
+    image.write_bytes(b"image")
+    variant = tmp_path / "variant.png"
+
+    def fake_create_variants(filepath):
+        assert Path(filepath) == image
+        variant.write_bytes(b"variant")
+        return [str(variant)]
+
+    def fake_rapid_ocr(filepath):
+        if Path(filepath) == variant:
+            return "收货凭证\n进仓编号 JC260404184\n总件数 244"
+        return ""
+
+    monkeypatch.setattr(fc, "_create_preprocessed_image_variants", fake_create_variants)
+    monkeypatch.setattr(fc, "rapid_ocr_text", fake_rapid_ocr)
+
+    text = fc.ocr_text(str(image))
+
+    assert "收货凭证" in text
+    assert "JC260404184" in text
+    assert not variant.exists()
+
+
+def test_warehouse_receipt_style_packing_list_auto_matches(monkeypatch, tmp_path):
+    image = tmp_path / "装箱单.jpg"
+    image.write_bytes(b"image")
+    ocr_text = (
+        "收货凭证\n"
+        "进仓编号 L26004034TH\n"
+        "客户名称 海森\n"
+        "车号 苏FA62359\n"
+        "包装 纸箱\n"
+        "件数 244\n"
+        "总体积 24.02\n"
+        "重量 1290"
+    )
+
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: ocr_text)
+
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+    result = classifier.classify_file(str(image), "LY26117023")
+
+    assert result["status"] == "matched"
+    assert result["material_id"] == "packing_list"
+    assert result["score"] >= 70
+
+
+def test_packing_list_filename_with_readable_ocr_text_gets_review_safe_fallback(monkeypatch, tmp_path):
+    image = tmp_path / "装箱单.jpeg"
+    image.write_bytes(b"image")
+    fuzzy_text = " ".join(["模糊OCR文本"] * 30)
+
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: fuzzy_text)
+
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+    result = classifier.classify_file(str(image), "LY25117241")
+
+    assert result["status"] == "matched"
+    assert result["material_id"] == "packing_list"
+    assert "OCR文本可用:装箱单文件名兜底" in result["reasons"]
+
+
 def complete_material_texts():
     return {
         "random_a.pdf": (
@@ -751,6 +815,163 @@ def test_move_file_to_output_adds_repeat_suffix_for_duplicate_generic_material(t
     assert Path(dest_path) == output_dir / "LY25112915" / "装箱单_重复1.pdf"
     assert existing.read_text(encoding="utf-8") == "old"
     assert Path(dest_path).read_text(encoding="utf-8") == "new"
+
+
+def test_move_file_to_output_skips_unmatched_when_requested(tmp_path):
+    source = tmp_path / "watch" / "totally_unrelated_file.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_text("data", encoding="utf-8")
+    output_dir = tmp_path / "output"
+
+    success, subfolder, message, dest_path, invoice_no, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        unmatched_action="skip",
+    )
+
+    assert success is True
+    assert status == fc.STATUS_SKIPPED
+    assert subfolder == ""
+    assert invoice_no == ""
+    assert dest_path == str(source)
+    assert source.exists()
+    assert not (output_dir / fc.REVIEW_SUBFOLDER).exists()
+    assert "已跳过" in message
+
+
+def test_move_file_to_output_skips_non_tax_material_from_invoice_folder(tmp_path):
+    watch_dir = tmp_path / "watch"
+    source = watch_dir / "25112915" / "17箱 箱唛.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_text("shipping mark", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    success, subfolder, message, dest_path, invoice_no, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        invoice_dir_resolver=processor.resolve_target_folder,
+        source_root=str(watch_dir),
+        material_classifier=processor.classifier,
+        unmatched_action="skip",
+    )
+
+    assert success is True
+    assert status == fc.STATUS_SKIPPED
+    assert invoice_no == "LY25112915"
+    assert subfolder == "LY25112915"
+    assert dest_path == str(source)
+    assert source.exists()
+    assert not (output_dir / "LY25112915").exists()
+    assert "非退税材料" in message
+
+
+def test_move_file_to_output_routes_recognized_tax_material_from_invoice_folder(tmp_path):
+    watch_dir = tmp_path / "watch"
+    source = watch_dir / "25112915" / "提单.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_text("bill", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    success, subfolder, message, dest_path, invoice_no, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        invoice_dir_resolver=processor.resolve_target_folder,
+        source_root=str(watch_dir),
+        material_classifier=processor.classifier,
+        unmatched_action="skip",
+    )
+
+    assert success is True
+    assert status == "成功"
+    assert invoice_no == "LY25112915"
+    assert subfolder == "LY25112915"
+    assert Path(dest_path) == output_dir / "LY25112915" / "提单.pdf"
+    assert not source.exists()
+    assert "成功" in message
+
+
+def test_move_file_to_output_honors_stop_event_before_cutting_file(tmp_path):
+    source = tmp_path / "watch" / "LY25112915 提单.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_text("bill", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    stop_event = fc.threading.Event()
+    stop_event.set()
+
+    success, _, _, dest_path, _, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        stop_event=stop_event,
+    )
+
+    assert success is True
+    assert status == fc.STATUS_SKIPPED
+    assert dest_path == str(source)
+    assert source.exists()
+    assert not output_dir.exists()
+
+
+def test_copy_invoice_folder_filters_non_tax_materials(tmp_path):
+    output_dir = tmp_path / "output"
+    source_folder = output_dir / "LY25112915"
+    source_folder.mkdir(parents=True)
+    tax_file = source_folder / "提单.pdf"
+    extra_file = source_folder / "17箱 箱唛.pdf"
+    tax_file.write_text("bill", encoding="utf-8")
+    extra_file.write_text("shipping mark", encoding="utf-8")
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    copied = fc.copy_invoice_folder(
+        str(source_folder),
+        str(tmp_path / "batch"),
+        "LY25112915",
+        {},
+        material_classifier=processor.classifier,
+    )
+
+    copied_folder = Path(copied)
+    assert (copied_folder / tax_file.name).exists()
+    assert not (copied_folder / extra_file.name).exists()
+    assert tax_file.exists()
+    assert extra_file.exists()
+
+
+def test_excel_logger_writes_source_and_destination_trace_columns(tmp_path):
+    logger = fc.ExcelLogger(str(tmp_path))
+    logger.add_record(
+        "提单.pdf",
+        "LY25112915",
+        "成功",
+        invoice_no="LY25112915",
+        source_path=str(tmp_path / "watch" / "提单.pdf"),
+        dest_path=str(tmp_path / "output" / "LY25112915" / "提单.pdf"),
+        message="成功: 提单.pdf",
+    )
+
+    logger.save()
+
+    workbook_path = next(tmp_path.glob("工作日志_*.xlsx"))
+    wb = openpyxl.load_workbook(workbook_path)
+    try:
+        ws = wb["处理明细"]
+        headers = [cell.value for cell in ws[1]]
+        assert "源路径" in headers
+        assert "目标路径" in headers
+        assert "说明" in headers
+        source_col = headers.index("源路径") + 1
+        dest_col = headers.index("目标路径") + 1
+        message_col = headers.index("说明") + 1
+        assert ws.cell(row=2, column=source_col).value.endswith("watch/提单.pdf")
+        assert ws.cell(row=2, column=dest_col).value.endswith("output/LY25112915/提单.pdf")
+        assert ws.cell(row=2, column=message_col).value == "成功: 提单.pdf"
+    finally:
+        wb.close()
 
 
 def test_load_finance_batch_invoices_reads_headers_first_column_multisheet_and_dedup(tmp_path):
