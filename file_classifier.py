@@ -2,7 +2,7 @@
 文件自动归类程序
 ================
 功能：
-  1. 实时递归监视指定文件夹，文件写入完成后将其剪切到输出文件夹
+  1. 实时递归监视指定文件夹，文件写入完成后将其复制到输出文件夹
   2. 按程序同目录下的发票号清单 Excel 第一列发票号匹配文件名前缀，自动归入对应发票号子文件夹
   3. 识别退税材料齐套状态，生成判断报告，并按报关号改名发票号文件夹
   4. 输出主文件夹生成以日期命名的 JSON / Excel 工作日志
@@ -27,6 +27,7 @@ import json
 import tempfile
 import unicodedata
 import argparse
+import filecmp
 from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -194,6 +195,17 @@ def unique_path(path: str) -> str:
         if not os.path.exists(candidate):
             return candidate
         counter += 1
+
+
+def files_have_same_content(first_path: str, second_path: str) -> bool:
+    try:
+        if not os.path.isfile(first_path) or not os.path.isfile(second_path):
+            return False
+        if os.path.getsize(first_path) != os.path.getsize(second_path):
+            return False
+        return filecmp.cmp(first_path, second_path, shallow=False)
+    except OSError:
+        return False
 
 
 def merge_folder_contents(source_dir: str, target_dir: str) -> None:
@@ -684,7 +696,8 @@ def move_file_to_output(
     stop_event: threading.Event = None,
 ) -> tuple:
     """
-    将文件剪切到输出目录的发票号子文件夹。
+    将文件复制到输出目录的发票号子文件夹。
+    函数名保留 move_file_to_output 是为了兼容既有调用。
     返回 (success, subfolder, message, dest_path, invoice_no, status)
     """
     filename = os.path.basename(src_path)
@@ -754,17 +767,35 @@ def move_file_to_output(
         dest_path = os.path.join(dest_dir, filename)
 
         if os.path.exists(dest_path):
+            if files_have_same_content(src_path, dest_path):
+                if matched:
+                    return (
+                        True,
+                        actual_subfolder_name,
+                        f"目标已存在，已复用: {filename} → {actual_subfolder_name}/",
+                        dest_path,
+                        invoice_no,
+                        "成功",
+                    )
+                return (
+                    True,
+                    subfolder_name,
+                    f"未匹配发票号，人工复核中已存在相同文件: {filename} → {subfolder_name}/",
+                    dest_path,
+                    invoice_no,
+                    "未匹配",
+                )
             dest_path = unique_path(dest_path)
 
         if stop_event and stop_event.is_set():
             return True, "", f"监控已停止，已取消处理: {filename}", src_path, invoice_no, STATUS_SKIPPED
-        shutil.move(src_path, dest_path)
+        shutil.copy2(src_path, dest_path)
         if matched:
-            return True, actual_subfolder_name, f"成功: {filename} → {actual_subfolder_name}/", dest_path, invoice_no, "成功"
+            return True, actual_subfolder_name, f"成功复制: {filename} → {actual_subfolder_name}/", dest_path, invoice_no, "成功"
         return (
             True,
             subfolder_name,
-            f"未匹配发票号，已移入人工复核: {filename} → {subfolder_name}/",
+            f"未匹配发票号，已复制到人工复核: {filename} → {subfolder_name}/",
             dest_path,
             invoice_no,
             "未匹配",
@@ -3232,14 +3263,14 @@ class FileHandler(FileSystemEventHandler if Observer else object):
             )
             if success and status == "成功":
                 self.log_callback(f"✅ {msg}", processed=True)
-                self.log_callback(f"   路径: {filepath} -> {dest_path}")
+                self.log_callback(f"   复制路径: {filepath} -> {dest_path}")
             elif success and status == STATUS_SKIPPED:
                 self.log_callback(f"⏭ {msg}")
                 self.log_callback(f"   保留位置: {filepath}")
             elif success:
                 self.log_callback(f"⚠ {msg}", processed=True)
                 if dest_path:
-                    self.log_callback(f"   路径: {filepath} -> {dest_path}")
+                    self.log_callback(f"   复制路径: {filepath} -> {dest_path}")
             else:
                 self.log_callback(f"❌ {msg}")
             self.excel_logger.add_record(

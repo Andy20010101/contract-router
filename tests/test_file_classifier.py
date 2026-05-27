@@ -739,6 +739,7 @@ def test_move_file_to_output_uses_existing_digits_folder(tmp_path):
     assert subfolder == "25112915"
     assert "25112915/" in message
     assert Path(dest_path).parent == digits_folder
+    assert source.exists()
     assert not (output_dir / "LY25112915").exists()
 
 
@@ -763,6 +764,7 @@ def test_move_file_to_output_uses_existing_ly_prefixed_child_folder(tmp_path):
     assert subfolder == "LY25112915 上海客户"
     assert "LY25112915 上海客户/" in message
     assert Path(dest_path) == prefixed_folder / "LY25112915 提单.pdf"
+    assert source.exists()
     assert not (output_dir / "LY25112915").exists()
 
 
@@ -786,8 +788,9 @@ def test_move_file_to_output_matches_invoice_parent_folder_for_generic_material(
     assert status == "成功"
     assert invoice_no == "LY25112915"
     assert subfolder == "LY25112915"
-    assert message == "成功: 装箱单.pdf → LY25112915/"
+    assert message == "成功复制: 装箱单.pdf → LY25112915/"
     assert Path(dest_path) == output_dir / "LY25112915" / "装箱单.pdf"
+    assert source.exists()
 
 
 def test_move_file_to_output_adds_repeat_suffix_for_duplicate_generic_material(tmp_path):
@@ -815,6 +818,36 @@ def test_move_file_to_output_adds_repeat_suffix_for_duplicate_generic_material(t
     assert Path(dest_path) == output_dir / "LY25112915" / "装箱单_重复1.pdf"
     assert existing.read_text(encoding="utf-8") == "old"
     assert Path(dest_path).read_text(encoding="utf-8") == "new"
+    assert source.exists()
+
+
+def test_move_file_to_output_reuses_existing_same_file_without_repeat_suffix(tmp_path):
+    watch_dir = tmp_path / "watch"
+    source = watch_dir / "25112915" / "装箱单.pdf"
+    source.parent.mkdir(parents=True)
+    source.write_text("same", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    existing = output_dir / "LY25112915" / "装箱单.pdf"
+    existing.parent.mkdir(parents=True)
+    existing.write_text("same", encoding="utf-8")
+    processor = fc.TaxRefundProcessor(str(output_dir), config_path=tmp_path / "materials_config.json")
+
+    success, subfolder, message, dest_path, invoice_no, status = fc.move_file_to_output(
+        str(source),
+        str(output_dir),
+        fc.InvoiceMatcher(["LY25112915"]),
+        invoice_dir_resolver=processor.resolve_target_folder,
+        source_root=str(watch_dir),
+    )
+
+    assert success is True
+    assert status == "成功"
+    assert invoice_no == "LY25112915"
+    assert subfolder == "LY25112915"
+    assert Path(dest_path) == existing
+    assert not (existing.parent / "装箱单_重复1.pdf").exists()
+    assert source.exists()
+    assert "已复用" in message
 
 
 def test_move_file_to_output_skips_unmatched_when_requested(tmp_path):
@@ -891,11 +924,11 @@ def test_move_file_to_output_routes_recognized_tax_material_from_invoice_folder(
     assert invoice_no == "LY25112915"
     assert subfolder == "LY25112915"
     assert Path(dest_path) == output_dir / "LY25112915" / "提单.pdf"
-    assert not source.exists()
+    assert source.exists()
     assert "成功" in message
 
 
-def test_move_file_to_output_honors_stop_event_before_cutting_file(tmp_path):
+def test_move_file_to_output_honors_stop_event_before_copying_file(tmp_path):
     source = tmp_path / "watch" / "LY25112915 提单.pdf"
     source.parent.mkdir(parents=True)
     source.write_text("bill", encoding="utf-8")
