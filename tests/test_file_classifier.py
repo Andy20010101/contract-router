@@ -967,8 +967,8 @@ def test_excel_logger_writes_source_and_destination_trace_columns(tmp_path):
         source_col = headers.index("源路径") + 1
         dest_col = headers.index("目标路径") + 1
         message_col = headers.index("说明") + 1
-        assert ws.cell(row=2, column=source_col).value.endswith("watch/提单.pdf")
-        assert ws.cell(row=2, column=dest_col).value.endswith("output/LY25112915/提单.pdf")
+        assert Path(ws.cell(row=2, column=source_col).value).parts[-2:] == ("watch", "提单.pdf")
+        assert Path(ws.cell(row=2, column=dest_col).value).parts[-3:] == ("output", "LY25112915", "提单.pdf")
         assert ws.cell(row=2, column=message_col).value == "成功: 提单.pdf"
     finally:
         wb.close()
