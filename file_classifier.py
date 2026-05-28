@@ -7,7 +7,7 @@
   3. 识别退税材料齐套状态，生成判断报告，并按报关号改名发票号文件夹
   4. 输出主文件夹生成以日期命名的 JSON / Excel 工作日志
   5. 图形界面，适合普通用户操作
-  6. 支持同时处理1000+文件（线程池并发处理）
+  6. 支持批量文件处理（后台队列处理，避免界面卡死）
 
 依赖安装：
   pip install watchdog openpyxl PyMuPDF rapidocr-onnxruntime
@@ -76,6 +76,7 @@ STATUS_SKIPPED = "跳过"
 STATUS_PLANNED = "预览"
 DEFAULT_DECLARATION_TIMEOUT_SECONDS = 60.0
 SAFE_BATCH_CONFIRM_LIMIT = 20
+MAX_FILE_PROCESS_WORKERS = 4
 OPERATION_MANIFEST_SCHEMA = "contract-router-operation-manifest/v1"
 OPERATION_MANIFEST_DIRNAME = "_操作日志"
 OPERATION_MANIFEST_PREFIX = "operation_manifest_"
@@ -1065,7 +1066,12 @@ def move_file_to_output(
 
     if matched and material_classifier:
         try:
-            classification = material_classifier.classify_file(src_path, invoice_no)
+            route_classifier = getattr(
+                material_classifier,
+                "classify_file_for_routing",
+                material_classifier.classify_file,
+            )
+            classification = route_classifier(src_path, invoice_no)
         except Exception as exc:
             return (
                 True,
@@ -1998,6 +2004,45 @@ class MaterialClassifier:
 
     def required_names(self) -> list[str]:
         return [m["name"] for m in self.materials if m.get("required")]
+
+    def classify_file_for_routing(self, filepath: str, invoice_no: str) -> dict:
+        """Fast path used while files enter the watch folder.
+
+        Detailed closed-loop checks still call classify_file(), which can use
+        PDF extraction and OCR. Routing only needs to know whether a file looks
+        like a tax material, so a clear material keyword in the file name is
+        enough to keep the UI responsive during large drops.
+        """
+        filename = os.path.basename(filepath)
+        stripped_name = strip_invoice_prefix(filename, invoice_no)
+        best = None
+        for material in self.materials:
+            score, reasons = self._score_file_name(material, stripped_name)
+            if best is None or score > best["score"]:
+                best = {
+                    "material": material,
+                    "score": score,
+                    "reasons": reasons,
+                }
+
+        if best and best["score"] >= self.manual_score:
+            material = best["material"]
+            return {
+                "filename": filename,
+                "path": filepath,
+                "stripped_name": stripped_name,
+                "material": material,
+                "material_id": material["id"],
+                "material_name": material["name"],
+                "required": bool(material.get("required")),
+                "score": best["score"],
+                "status": "matched" if material.get("file_name_only") else "manual_review",
+                "reasons": best["reasons"],
+                "text": "",
+                "normalized_text": "",
+            }
+
+        return self.classify_file(filepath, invoice_no)
 
     def classify_file(self, filepath: str, invoice_no: str) -> dict:
         filename = os.path.basename(filepath)
@@ -4338,8 +4383,9 @@ class App(tk.Tk):
         self.watch_dir.set(watch)
         self.output_dir.set(output)
 
-        # 创建线程池（支持1000+并发文件）
-        self.executor = ThreadPoolExecutor(max_workers=64)
+        # OCR and PDF parsing are CPU-heavy, especially in Windows VMs.
+        # Keep concurrency bounded so the UI remains usable during batch drops.
+        self.executor = ThreadPoolExecutor(max_workers=MAX_FILE_PROCESS_WORKERS)
 
         # 创建 Excel 日志管理器
         self.excel_logger = ExcelLogger(output)

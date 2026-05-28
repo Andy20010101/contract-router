@@ -134,6 +134,23 @@ def test_bill_of_lading_matches_scanned_ocr_text_without_filename_keyword(monkey
     assert result["material_id"] == "bill_of_lading"
 
 
+def test_routing_classifier_uses_filename_without_ocr(monkeypatch, tmp_path):
+    document = tmp_path / "25112915_外销_客户回签.pdf"
+    document.write_bytes(b"pdf")
+
+    def fail_text_read(*args, **kwargs):
+        raise AssertionError("routing classification should not OCR clear filenames")
+
+    monkeypatch.setattr(fc, "pdf_text", fail_text_read)
+    monkeypatch.setattr(fc, "ocr_text", fail_text_read)
+
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+    result = classifier.classify_file_for_routing(str(document), "LY25112915")
+
+    assert result["status"] == "manual_review"
+    assert result["material_id"] == "export_sales"
+
+
 def test_image_ocr_uses_preprocessed_variants(monkeypatch, tmp_path):
     image = tmp_path / "装箱单.jpg"
     image.write_bytes(b"image")
