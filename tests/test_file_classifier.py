@@ -30,6 +30,7 @@ def patch_app_paths(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(fc, "SCRIPT_DIR", tmp_path)
     monkeypatch.setattr(fc, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(fc, "DEFAULT_COMPANY_LEDGER", tmp_path / "data" / "公司系统出运统计发票号清单.xlsx")
+    monkeypatch.setattr(fc, "DEFAULT_SHIPMENT_LEDGER", tmp_path / "data" / "出运闭环台账.xlsx")
     monkeypatch.setattr(fc, "DEFAULT_INVOICE_WORKBOOK", tmp_path / "04月发票号清单.xlsx")
     monkeypatch.setattr(fc, "APP_SETTINGS_PATH", tmp_path / "app_settings.json")
 
@@ -80,6 +81,99 @@ def test_find_invoice_workbook_uses_fixed_ledger_and_never_scans_batch(monkeypat
     legacy = fc.DEFAULT_INVOICE_WORKBOOK
     legacy.touch()
     assert fc.find_invoice_workbook(settings) == legacy
+
+
+def test_find_shipment_workbook_uses_optional_data_file(monkeypatch, tmp_path):
+    patch_app_paths(monkeypatch, tmp_path)
+    settings = fc.default_app_settings()
+
+    assert fc.find_shipment_workbook(settings) is None
+
+    shipment_ledger = fc.DEFAULT_SHIPMENT_LEDGER
+    shipment_ledger.parent.mkdir(parents=True)
+    shipment_ledger.touch()
+
+    assert fc.find_shipment_workbook(settings) == shipment_ledger
+
+
+def test_shipment_ledger_supplements_only_matching_main_ledger_rows():
+    company_records = {
+        "LY25117241": {"发票号": "LY25117241", "出运日期": "", "目的国": "", "金额": ""},
+        "LY25117260": {"发票号": "LY25117260", "出运日期": "2026-02-08", "目的国": "波兰", "金额": 45916.29},
+    }
+    shipment_records = {
+        "LY25117241": {"发票号": "LY25117241", "出运日期": "2026-03-26", "目的国": "澳大利亚", "金额": 2045},
+        "LY99999999": {"发票号": "LY99999999", "出运日期": "2026-04-01", "目的国": "德国", "金额": 100},
+    }
+
+    merged, summary = fc.merge_shipment_closed_loop_records(company_records, shipment_records)
+
+    assert set(merged) == {"LY25117241", "LY25117260"}
+    assert merged["LY25117241"]["出运日期"] == "2026-03-26"
+    assert merged["LY25117241"]["目的国"] == "澳大利亚"
+    assert merged["LY25117241"]["金额"] == 2045
+    assert "出运日期:出运闭环台账" in merged["LY25117241"]["闭环字段来源"]
+    assert merged["LY25117260"]["闭环字段来源"] == "主台账"
+    assert summary["matched"] == 1
+    assert summary["supplemented"] == 3
+    assert summary["extra"] == 1
+    assert summary["conflicts"] == 0
+
+
+def test_shipment_ledger_preserves_main_values_and_marks_conflicts():
+    company_records = {
+        "LY25117260": {"发票号": "LY25117260", "出运日期": "2026-02-08", "目的国": "波兰", "金额": 45916.29},
+    }
+    shipment_records = {
+        "25117260": {"发票号": "25117260", "出运日期": "2026-02-08", "目的国": "波兰", "金额": 45000},
+    }
+
+    merged, summary = fc.merge_shipment_closed_loop_records(company_records, shipment_records)
+
+    assert merged["LY25117260"]["金额"] == 45916.29
+    assert "金额 主台账=45916.29 / 出运闭环台账=45000" in merged["LY25117260"]["台账字段冲突"]
+    assert "出运日期:主台账" in merged["LY25117260"]["闭环字段来源"]
+    assert summary["matched"] == 1
+    assert summary["conflicts"] == 1
+
+
+def test_load_invoice_records_for_app_merges_multisheet_shipment_ledger(monkeypatch, tmp_path):
+    patch_app_paths(monkeypatch, tmp_path)
+    settings = fc.default_app_settings()
+    save_workbook(
+        fc.DEFAULT_COMPANY_LEDGER,
+        {
+            "台账": [
+                ["发票号"],
+                ["LY25117241"],
+                ["LY25117260"],
+            ],
+        },
+    )
+    save_workbook(
+        fc.DEFAULT_SHIPMENT_LEDGER,
+        {
+            "1月": [
+                ["发票号", "出运日期", "目的国(地区)", "金额"],
+                ["LY25117260", "2026-02-08", "波兰", 45916.29],
+            ],
+            "4月": [
+                ["发票号", "出运日期", "目的国(地区)", "金额"],
+                ["LY25117241", "2026-03-26", "澳大利亚", 2045],
+                ["LY99999999", "2026-04-01", "德国", 100],
+            ],
+        },
+    )
+
+    workbook, records, summary = fc.load_invoice_records_for_app(settings)
+
+    assert workbook == fc.DEFAULT_COMPANY_LEDGER
+    assert set(records) == {"LY25117241", "LY25117260"}
+    assert records["LY25117241"]["目的国"] == "澳大利亚"
+    assert records["LY25117260"]["金额"] == 45916.29
+    assert summary["matched"] == 2
+    assert summary["supplemented"] == 6
+    assert summary["extra"] == 1
 
 
 def test_invoice_matcher_purchase_contract_fallback():

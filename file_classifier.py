@@ -63,6 +63,7 @@ DEFAULT_INVOICE_WORKBOOK = SCRIPT_DIR / "04月发票号清单.xlsx"
 APP_SETTINGS_PATH = SCRIPT_DIR / "app_settings.json"
 DATA_DIR = SCRIPT_DIR / "data"
 DEFAULT_COMPANY_LEDGER = DATA_DIR / "公司系统出运统计发票号清单.xlsx"
+DEFAULT_SHIPMENT_LEDGER = DATA_DIR / "出运闭环台账.xlsx"
 DEFAULT_MATERIAL_CONFIG = SCRIPT_DIR / "materials_config.json"
 REVIEW_SUBFOLDER = "未匹配发票号"
 IGNORED_SUFFIXES = {
@@ -88,6 +89,9 @@ def default_app_settings() -> dict:
     return {
         "company_ledger": {
             "path": "data/公司系统出运统计发票号清单.xlsx"
+        },
+        "shipment_ledger": {
+            "path": "data/出运闭环台账.xlsx"
         },
         "finance_batch": {
             "output_subdir": "财务退税批次包",
@@ -786,6 +790,17 @@ def find_invoice_workbook(settings: dict | None = None):
     return None
 
 
+def find_shipment_workbook(settings: dict | None = None):
+    settings = settings or ensure_app_settings(APP_SETTINGS_PATH)
+    ledger_path = resolve_app_path(
+        settings.get("shipment_ledger", {}).get(
+            "path",
+            "data/出运闭环台账.xlsx",
+        )
+    )
+    return ledger_path if ledger_path.exists() else None
+
+
 def load_invoice_numbers(workbook_path: str) -> list[str]:
     if openpyxl is None:
         raise RuntimeError("缺少 openpyxl，无法读取发票号清单")
@@ -855,6 +870,119 @@ def load_invoice_records(workbook_path: str) -> dict[str, dict]:
         wb.close()
 
     return records
+
+
+def _record_field_present(record: dict, field: str) -> bool:
+    value = record.get(field)
+    return value not in (None, "")
+
+
+def _ledger_field_equal(field: str, left, right) -> bool:
+    if field == "金额":
+        return amounts_equal(left, right)
+    return str(left or "").strip() == str(right or "").strip()
+
+
+def _find_equivalent_record(records: dict[str, dict], invoice_no: str) -> tuple[str, dict]:
+    if invoice_no in records:
+        return invoice_no, records[invoice_no]
+    for key, record in records.items():
+        if invoice_equivalent(key, invoice_no):
+            return key, record
+    return "", {}
+
+
+def merge_shipment_closed_loop_records(
+    company_records: dict[str, dict],
+    shipment_records: dict[str, dict],
+) -> tuple[dict[str, dict], dict]:
+    """用出运闭环台账补主台账的日期、目的国、金额；不新增主台账外的发票号。"""
+    merged = {invoice_no: dict(record) for invoice_no, record in company_records.items()}
+    summary = {
+        "shipment_records": len(shipment_records or {}),
+        "matched": 0,
+        "supplemented": 0,
+        "conflicts": 0,
+        "extra": 0,
+        "path": "",
+    }
+    if not shipment_records:
+        return merged, summary
+
+    matched_shipment_keys = set()
+    closed_loop_fields = ["出运日期", "目的国", "金额"]
+    for invoice_no, record in merged.items():
+        shipment_key, shipment_record = _find_equivalent_record(shipment_records, invoice_no)
+        if not shipment_record:
+            record["闭环字段来源"] = record.get("闭环字段来源") or "主台账"
+            continue
+
+        matched_shipment_keys.add(shipment_key)
+        summary["matched"] += 1
+        sources = []
+        conflicts = []
+        for field in closed_loop_fields:
+            company_has = _record_field_present(record, field)
+            shipment_has = _record_field_present(shipment_record, field)
+            if company_has and shipment_has:
+                if _ledger_field_equal(field, record.get(field), shipment_record.get(field)):
+                    sources.append(f"{field}:主台账")
+                else:
+                    conflicts.append(
+                        f"{field} 主台账={record.get(field)} / 出运闭环台账={shipment_record.get(field)}"
+                    )
+                continue
+            if shipment_has and not company_has:
+                record[field] = shipment_record.get(field)
+                sources.append(f"{field}:出运闭环台账")
+                summary["supplemented"] += 1
+            elif company_has:
+                sources.append(f"{field}:主台账")
+            else:
+                sources.append(f"{field}:缺失")
+
+        if conflicts:
+            summary["conflicts"] += len(conflicts)
+            record["台账字段冲突"] = "；".join(conflicts)
+        record["闭环字段来源"] = "；".join(sources)
+
+    summary["extra"] = max(0, len(shipment_records) - len(matched_shipment_keys))
+    return merged, summary
+
+
+def load_invoice_records_for_app(settings: dict, log_callback=None) -> tuple[Path, dict[str, dict], dict]:
+    invoice_workbook = find_invoice_workbook(settings)
+    if not invoice_workbook:
+        raise FileNotFoundError(f"未找到公司系统出运统计发票号清单：{DEFAULT_COMPANY_LEDGER}")
+
+    company_records = load_invoice_records(str(invoice_workbook))
+    shipment_workbook = find_shipment_workbook(settings)
+    summary = {
+        "company_path": str(invoice_workbook),
+        "shipment_path": str(shipment_workbook) if shipment_workbook else "",
+        "shipment_records": 0,
+        "matched": 0,
+        "supplemented": 0,
+        "conflicts": 0,
+        "extra": 0,
+    }
+    if shipment_workbook:
+        shipment_records = load_invoice_records(str(shipment_workbook))
+        company_records, merge_summary = merge_shipment_closed_loop_records(company_records, shipment_records)
+        merge_summary["path"] = str(shipment_workbook)
+        summary.update(merge_summary)
+        if log_callback:
+            log_callback(
+                f"📘 出运闭环台账: {shipment_workbook}（匹配 {summary['matched']} 个发票号，"
+                f"补充 {summary['supplemented']} 个字段，额外 {summary['extra']} 个发票号）"
+            )
+            if summary["conflicts"]:
+                log_callback(f"⚠ 出运闭环台账存在 {summary['conflicts']} 个字段冲突，已写入判断报告")
+    else:
+        if log_callback:
+            log_callback(f"ℹ 未找到出运闭环台账，可选路径: {DEFAULT_SHIPMENT_LEDGER}")
+
+    return invoice_workbook, company_records, summary
 
 
 class InvoiceMatcher:
@@ -2291,6 +2419,8 @@ def evaluate_closed_loop(invoice_no: str, ledger_record: dict, classifications: 
 
     if ledger_record and not ledger_invoice_ok:
         conflicts.append("台账发票号与当前发票号不一致")
+    if ledger_record and ledger_record.get("台账字段冲突"):
+        conflicts.append(f"台账字段冲突：{ledger_record.get('台账字段冲突')}")
     if not ledger_record:
         unverified.extend(["台账发票号未核验", "台账金额未核验", "台账目的国未核验", "台账出运日期未核验"])
 
@@ -2564,6 +2694,8 @@ class TaxRefundProcessor:
                     "闭环证据": "",
                     "闭环冲突": "",
                     "闭环未核验": "",
+                    "闭环字段来源": "",
+                    "台账字段冲突": "",
                     "是否已改名": "否",
                     "最后更新时间": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "备注": "输出目录中未找到该发票号文件夹",
@@ -2773,6 +2905,8 @@ class TaxRefundProcessor:
             "闭环证据": "；".join(closed_loop["evidence"]),
             "闭环冲突": "；".join(closed_loop["conflicts"]),
             "闭环未核验": "；".join(closed_loop.get("unverified", [])),
+            "闭环字段来源": ledger_record.get("闭环字段来源", ""),
+            "台账字段冲突": ledger_record.get("台账字段冲突", ""),
             "是否已改名": "是" if status == "已改名" else "否",
             "最后更新时间": time.strftime("%Y-%m-%d %H:%M:%S"),
             "备注": "",
@@ -3049,7 +3183,7 @@ class TaxRefundProcessor:
             "发票号", "最终发票号显示值", "报关号", "当前文件夹", "最终文件夹",
             "状态", "已识别必需材料", "缺少材料", "未识别文件", "重复材料",
             "需人工确认文件", "闭环状态", "闭环分数", "闭环证据", "闭环冲突", "闭环未核验",
-            "是否已改名", "最后更新时间", "备注",
+            "闭环字段来源", "台账字段冲突", "是否已改名", "最后更新时间", "备注",
         ]
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -3058,7 +3192,7 @@ class TaxRefundProcessor:
         ExcelLogger._style_header(ws, headers)
         for record in sorted(records, key=lambda item: item.get("发票号", "")):
             ws.append([record.get(header, "") for header in headers])
-        widths = [16, 18, 24, 45, 45, 14, 28, 28, 38, 28, 38, 16, 12, 55, 45, 45, 12, 22, 40]
+        widths = [16, 18, 24, 45, 45, 14, 28, 28, 38, 28, 38, 16, 12, 55, 45, 45, 45, 45, 12, 22, 40]
         for col_idx, width in enumerate(widths, start=1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
         wb.save(path)
@@ -3482,6 +3616,8 @@ def save_batch_report_excel(records: list[dict], path: str):
         "闭环证据",
         "闭环冲突",
         "闭环未核验",
+        "闭环字段来源",
+        "台账字段冲突",
         "报关号",
         "最后更新时间",
         "备注",
@@ -3495,7 +3631,7 @@ def save_batch_report_excel(records: list[dict], path: str):
     for record in records:
         ws_detail.append([record.get(header, "") for header in headers])
 
-    widths = [8, 18, 14, 14, 16, 45, 45, 28, 28, 38, 28, 38, 16, 12, 55, 45, 24, 22, 45]
+    widths = [8, 18, 14, 14, 16, 45, 45, 28, 28, 38, 28, 38, 16, 12, 55, 45, 45, 45, 45, 24, 22, 45]
     for col_idx, width in enumerate(widths, start=1):
         ws_detail.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
 
@@ -3612,6 +3748,16 @@ class FinanceBatchProcessor:
             raise RuntimeError("财务批次表中没有读取到发票号")
 
         ledger_records = load_invoice_records(self.company_ledger_path)
+        shipment_workbook = find_shipment_workbook(self.settings)
+        if shipment_workbook:
+            shipment_records = load_invoice_records(str(shipment_workbook))
+            ledger_records, merge_summary = merge_shipment_closed_loop_records(ledger_records, shipment_records)
+            self._log(
+                f"📘 出运闭环台账: {shipment_workbook}（匹配 {merge_summary['matched']} 个发票号，"
+                f"补充 {merge_summary['supplemented']} 个字段，额外 {merge_summary['extra']} 个发票号）"
+            )
+            if merge_summary["conflicts"]:
+                self._log(f"⚠ 出运闭环台账存在 {merge_summary['conflicts']} 个字段冲突，已写入批次报告")
         self.tax_processor.ledger_records = ledger_records
         batch_output_dir = self.build_batch_output_dir(batch_workbook_path)
         os.makedirs(batch_output_dir, exist_ok=True)
@@ -3674,6 +3820,8 @@ class FinanceBatchProcessor:
                 "闭环证据": record.get("闭环证据", ""),
                 "闭环冲突": record.get("闭环冲突", ""),
                 "闭环未核验": record.get("闭环未核验", ""),
+                "闭环字段来源": record.get("闭环字段来源", ""),
+                "台账字段冲突": record.get("台账字段冲突", ""),
                 "报关号": record.get("报关号", ""),
                 "最后更新时间": record.get("最后更新时间", ""),
                 "备注": remarks,
@@ -4321,13 +4469,16 @@ class App(tk.Tk):
         def worker():
             try:
                 settings = ensure_app_settings(APP_SETTINGS_PATH)
-                invoice_workbook = find_invoice_workbook(settings)
-                if not invoice_workbook:
+                try:
+                    invoice_workbook, invoice_records, _ledger_summary = load_invoice_records_for_app(
+                        settings,
+                        log_callback=self._enqueue_log,
+                    )
+                except FileNotFoundError:
                     raise RuntimeError(
                         "未找到公司系统出运统计发票号清单，请把主台账放到："
                         f"{DEFAULT_COMPANY_LEDGER}"
                     )
-                invoice_records = load_invoice_records(str(invoice_workbook))
                 invoice_numbers = sorted(invoice_records.keys(), key=len, reverse=True)
                 if not invoice_numbers:
                     raise RuntimeError(f"公司系统主台账没有可用发票号：{invoice_workbook}")
@@ -4398,16 +4549,17 @@ class App(tk.Tk):
         def worker():
             try:
                 settings = ensure_app_settings(APP_SETTINGS_PATH)
-                invoice_workbook = find_invoice_workbook(settings)
-                if not invoice_workbook:
+                try:
+                    invoice_workbook, invoice_records, _ledger_summary = load_invoice_records_for_app(settings)
+                except FileNotFoundError:
                     raise RuntimeError(
                         "未找到公司系统出运统计发票号清单，请把主台账放到："
                         f"{DEFAULT_COMPANY_LEDGER}"
                     )
                 if self.tax_processor:
                     tax_processor = self.tax_processor
+                    tax_processor.ledger_records = invoice_records
                 else:
-                    invoice_records = load_invoice_records(str(invoice_workbook))
                     tax_processor = TaxRefundProcessor(output, ledger_records=invoice_records)
 
                 processor = FinanceBatchProcessor(
@@ -4454,17 +4606,19 @@ class App(tk.Tk):
             return
 
         settings = ensure_app_settings(APP_SETTINGS_PATH)
-        invoice_workbook = find_invoice_workbook(settings)
-        if not invoice_workbook:
+        try:
+            invoice_workbook, invoice_records, _ledger_summary = load_invoice_records_for_app(
+                settings,
+                log_callback=self._enqueue_log,
+            )
+            invoice_numbers = sorted(invoice_records.keys(), key=len, reverse=True)
+        except FileNotFoundError:
             messagebox.showwarning(
                 "提示",
                 "未找到公司系统出运统计发票号清单。\n"
                 f"请把主台账放到：\n{DEFAULT_COMPANY_LEDGER}",
             )
             return
-        try:
-            invoice_records = load_invoice_records(str(invoice_workbook))
-            invoice_numbers = sorted(invoice_records.keys(), key=len, reverse=True)
         except Exception as exc:
             messagebox.showerror("发票号清单读取失败", str(exc))
             return
