@@ -1458,6 +1458,7 @@ def test_file_handler_sync_failure_does_not_affect_processing(monkeypatch, tmp_p
         pending_set={str(source)},
         tax_processor=FakeTaxProcessor(),
         ledger_sync_manager=FailingSyncManager(),
+        auto_rename=True,
     )
 
     handler._process(str(source))
@@ -1465,6 +1466,55 @@ def test_file_handler_sync_failure_does_not_affect_processing(monkeypatch, tmp_p
     assert logger.saved >= 1
     assert str(source) not in handler.pending_set
     assert any("公司主台账状态同步失败" in message for message, _ in logs)
+
+
+def test_file_handler_copy_only_mode_skips_invoice_judgement(monkeypatch, tmp_path):
+    source = tmp_path / "incoming.pdf"
+    source.write_bytes(b"data")
+    dest = tmp_path / "output" / "LY25112915" / "incoming.pdf"
+    dest.parent.mkdir(parents=True)
+    logs = []
+
+    class FakeExcelLogger:
+        def __init__(self):
+            self.saved = 0
+
+        def add_record(self, *args, **kwargs):
+            pass
+
+        def save(self):
+            self.saved += 1
+
+    class FailingTaxProcessor:
+        def resolve_target_folder(self, invoice_no):
+            return str(dest.parent)
+
+        def process_invoice(self, *args, **kwargs):
+            raise AssertionError("copy-only monitoring should not run invoice judgement")
+
+    monkeypatch.setattr(fc, "wait_for_file_ready", lambda *args, **kwargs: (True, ""))
+    monkeypatch.setattr(
+        fc,
+        "move_file_to_output",
+        lambda *args, **kwargs: (True, "LY25112915", "moved", str(dest), "LY25112915", "成功"),
+    )
+    logger = FakeExcelLogger()
+    handler = fc.FileHandler(
+        output_dir=str(tmp_path / "output"),
+        excel_logger=logger,
+        invoice_matcher=fc.InvoiceMatcher(["LY25112915"]),
+        executor=None,
+        log_callback=lambda message, processed=False: logs.append((message, processed)),
+        pending_set={str(source)},
+        tax_processor=FailingTaxProcessor(),
+        auto_rename=False,
+    )
+
+    handler._process(str(source))
+
+    assert logger.saved == 1
+    assert str(source) not in handler.pending_set
+    assert any(processed for _, processed in logs)
 
 
 def test_shell_e2e_report_marks_conflict_duplicate_and_unmatched(tmp_path):

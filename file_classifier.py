@@ -3940,6 +3940,7 @@ class FileHandler(FileSystemEventHandler if Observer else object):
                 and status == "成功"
                 and invoice_no
                 and self.tax_processor
+                and self.auto_rename
                 and not (self.stop_event and self.stop_event.is_set())
             ):
                 record = self.tax_processor.process_invoice(
