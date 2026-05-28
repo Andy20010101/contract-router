@@ -1544,6 +1544,62 @@ def test_process_all_invoice_folders_returns_tax_summary(monkeypatch, tmp_path):
     assert summary["records"][0]["退税齐套状态"] == "缺材料"
 
 
+def test_process_all_invoice_folders_can_skip_declaration_prompt(monkeypatch, tmp_path):
+    output_dir = tmp_path / "output"
+    invoice_dir = output_dir / "LY25112915"
+    invoice_dir.mkdir(parents=True)
+    processor = fc.TaxRefundProcessor(
+        str(output_dir),
+        config_path=tmp_path / "materials_config.json",
+        ledger_records={"LY25112915": {"发票号": "LY25112915"}},
+    )
+    calls = []
+    logs = []
+
+    def fake_evaluate_invoice(
+        invoice_no,
+        folder_path=None,
+        allow_prompt=False,
+        allow_rename=False,
+        save_report=False,
+        persist_declaration=True,
+        prompt_callback=None,
+    ):
+        calls.append({
+            "allow_prompt": allow_prompt,
+            "allow_rename": allow_rename,
+            "save_report": save_report,
+            "prompt_callback": prompt_callback,
+        })
+        return {
+            "发票号": invoice_no,
+            "当前文件夹": folder_path,
+            "状态": "待复核",
+            "缺少材料": "",
+            "需人工确认文件": "sample.pdf",
+            "闭环状态": "",
+            "最后更新时间": "2026-05-28 19:10:00",
+        }
+
+    monkeypatch.setattr(processor, "evaluate_invoice", fake_evaluate_invoice)
+
+    summary = processor.process_all_invoice_folders(
+        ["LY25112915"],
+        prompt_callback=lambda invoice_no: (_ for _ in ()).throw(AssertionError("should not prompt")),
+        log_callback=logs.append,
+        allow_rename=True,
+        allow_prompt=False,
+    )
+
+    assert summary["total"] == 1
+    assert len(calls) == 1
+    assert calls[0]["allow_prompt"] is False
+    assert calls[0]["allow_rename"] is True
+    assert calls[0]["save_report"] is True
+    assert calls[0]["prompt_callback"] is not None
+    assert any("正在检查 1/1" in message for message in logs)
+
+
 def test_shell_e2e_report_marks_conflict_duplicate_and_unmatched(tmp_path):
     report_path = tmp_path / "report.json"
     exit_code = fc.run_contract_router_e2e(

@@ -77,6 +77,7 @@ STATUS_PLANNED = "预览"
 DEFAULT_DECLARATION_TIMEOUT_SECONDS = 60.0
 SAFE_BATCH_CONFIRM_LIMIT = 20
 MAX_FILE_PROCESS_WORKERS = 4
+OCR_IMAGE_VARIANT_LIMIT = 1
 OPERATION_MANIFEST_SCHEMA = "contract-router-operation-manifest/v1"
 OPERATION_MANIFEST_DIRNAME = "_操作日志"
 OPERATION_MANIFEST_PREFIX = "operation_manifest_"
@@ -1829,8 +1830,10 @@ def _ocr_image_text(filepath: str) -> str:
         raw_text = rapid_ocr_text(filepath)
         if raw_text:
             texts.append(raw_text)
+            if len(normalize_document_text(raw_text)) >= 30:
+                return raw_text
         temp_paths = _create_preprocessed_image_variants(filepath)
-        for path in temp_paths:
+        for path in temp_paths[:OCR_IMAGE_VARIANT_LIMIT]:
             text = rapid_ocr_text(path)
             if text:
                 texts.append(text)
@@ -2617,13 +2620,34 @@ class TaxRefundProcessor:
         prompt_callback=None,
         log_callback=None,
         allow_rename: bool = True,
+        allow_prompt: bool = True,
     ) -> dict:
         records = []
-        for invoice_no in invoice_numbers:
+        for index, invoice_no in enumerate(invoice_numbers, start=1):
+            if log_callback:
+                log_callback(f"🔍 正在检查 {index}/{len(invoice_numbers)}: {invoice_no}")
             folder = self.resolve_target_folder(invoice_no)
             if not os.path.isdir(folder):
+                if log_callback:
+                    log_callback(f"⏭ 未找到发票文件夹，跳过检查: {invoice_no}")
                 continue
-            record = self.process_invoice(invoice_no, folder, prompt_callback=prompt_callback, allow_rename=allow_rename)
+            if allow_prompt:
+                record = self.process_invoice(
+                    invoice_no,
+                    folder,
+                    prompt_callback=prompt_callback,
+                    allow_rename=allow_rename,
+                )
+            else:
+                record = self.evaluate_invoice(
+                    invoice_no,
+                    folder,
+                    allow_prompt=False,
+                    allow_rename=allow_rename,
+                    save_report=True,
+                    persist_declaration=True,
+                    prompt_callback=prompt_callback,
+                )
             status_record = dict(record)
             status_record["退税齐套状态"] = tax_status_from_record(
                 record,
@@ -4327,6 +4351,7 @@ class App(tk.Tk):
                     prompt_callback=self._request_declaration_no,
                     log_callback=self._enqueue_log,
                     allow_rename=allow_rename,
+                    allow_prompt=False,
                 )
                 summary["report_dir"] = output
                 summary["operation_manifest"] = operation_manifest.path if operation_manifest else ""
