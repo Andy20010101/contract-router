@@ -1,19 +1,34 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
-hiddenimports = (
-    collect_submodules("rapidocr_onnxruntime")
-    + collect_submodules("rapidocr")
-    + collect_submodules("onnxruntime")
-    + collect_submodules("PIL")
-)
+def safe_collect_submodules(package_name):
+    try:
+        return collect_submodules(package_name)
+    except Exception:
+        return []
+
+
+def safe_collect_data_files(package_name):
+    try:
+        return collect_data_files(package_name)
+    except Exception:
+        return []
+
+
+hiddenimports = []
+datas = []
+for package_name in ("rapidocr_onnxruntime", "rapidocr", "onnxruntime", "PIL"):
+    hiddenimports += safe_collect_submodules(package_name)
+
+for package_name in ("rapidocr_onnxruntime", "rapidocr"):
+    datas += safe_collect_data_files(package_name)
 
 a = Analysis(
     ["file_classifier.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
