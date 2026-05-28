@@ -1407,7 +1407,7 @@ def test_finance_batch_processor_process_batch_creates_package_reports_and_statu
     assert cell_value_by_header(batch_path, "批次", "LY99999999", "退税齐套状态") == "不在主台账"
 
 
-def test_file_handler_sync_failure_does_not_affect_processing(monkeypatch, tmp_path):
+def test_file_handler_monitoring_skips_invoice_judgement_even_with_auto_rename(monkeypatch, tmp_path):
     source = tmp_path / "incoming.pdf"
     source.write_bytes(b"data")
     dest = tmp_path / "output" / "LY25112915" / "incoming.pdf"
@@ -1430,13 +1430,7 @@ def test_file_handler_sync_failure_does_not_affect_processing(monkeypatch, tmp_p
             return str(dest.parent)
 
         def process_invoice(self, invoice_no, folder_path, prompt_callback=None, allow_rename=True):
-            return {
-                "发票号": invoice_no,
-                "当前文件夹": folder_path,
-                "状态": "缺材料",
-                "缺少材料": "提单",
-                "最后更新时间": "2026-05-22 10:00:00",
-            }
+            raise AssertionError("monitoring should not run invoice judgement")
 
     class FailingSyncManager:
         def enqueue(self, invoice_no, record):
@@ -1465,7 +1459,7 @@ def test_file_handler_sync_failure_does_not_affect_processing(monkeypatch, tmp_p
 
     assert logger.saved >= 1
     assert str(source) not in handler.pending_set
-    assert any("公司主台账状态同步失败" in message for message, _ in logs)
+    assert not any("公司主台账状态同步失败" in message for message, _ in logs)
 
 
 def test_file_handler_copy_only_mode_skips_invoice_judgement(monkeypatch, tmp_path):
@@ -1515,6 +1509,39 @@ def test_file_handler_copy_only_mode_skips_invoice_judgement(monkeypatch, tmp_pa
     assert logger.saved == 1
     assert str(source) not in handler.pending_set
     assert any(processed for _, processed in logs)
+
+
+def test_process_all_invoice_folders_returns_tax_summary(monkeypatch, tmp_path):
+    output_dir = tmp_path / "output"
+    invoice_dir = output_dir / "LY25112915"
+    invoice_dir.mkdir(parents=True)
+    processor = fc.TaxRefundProcessor(
+        str(output_dir),
+        config_path=tmp_path / "materials_config.json",
+        ledger_records={"LY25112915": {"发票号": "LY25112915"}},
+    )
+
+    def fake_process_invoice(invoice_no, folder_path, prompt_callback=None, allow_rename=True):
+        return {
+            "发票号": invoice_no,
+            "当前文件夹": folder_path,
+            "状态": "缺材料",
+            "缺少材料": "提单",
+            "需人工确认文件": "",
+            "闭环状态": "",
+            "最后更新时间": "2026-05-28 18:30:00",
+        }
+
+    monkeypatch.setattr(processor, "process_invoice", fake_process_invoice)
+
+    summary = processor.process_all_invoice_folders(
+        ["LY25112915", "LY99999999"],
+        allow_rename=False,
+    )
+
+    assert summary["total"] == 1
+    assert summary["counts"]["缺材料"] == 1
+    assert summary["records"][0]["退税齐套状态"] == "缺材料"
 
 
 def test_shell_e2e_report_marks_conflict_duplicate_and_unmatched(tmp_path):

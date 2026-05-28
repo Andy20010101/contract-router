@@ -2617,14 +2617,31 @@ class TaxRefundProcessor:
         prompt_callback=None,
         log_callback=None,
         allow_rename: bool = True,
-    ):
+    ) -> dict:
+        records = []
         for invoice_no in invoice_numbers:
             folder = self.resolve_target_folder(invoice_no)
             if not os.path.isdir(folder):
                 continue
             record = self.process_invoice(invoice_no, folder, prompt_callback=prompt_callback, allow_rename=allow_rename)
+            status_record = dict(record)
+            status_record["退税齐套状态"] = tax_status_from_record(
+                record,
+                in_ledger=True,
+                folder_exists=True,
+            )
+            records.append(status_record)
             if record and log_callback:
-                log_callback(f"📋 判断报告: {invoice_no} | {record.get('状态', '')}")
+                log_callback(
+                    f"📋 退税材料检查: {invoice_no} | "
+                    f"{status_record.get('退税齐套状态', '')} | "
+                    f"缺少: {record.get('缺少材料') or '无'}"
+                )
+        return {
+            "total": len(records),
+            "counts": _batch_summary_counts(records),
+            "records": records,
+        }
 
     def _build_record(
         self,
@@ -3935,30 +3952,6 @@ class FileHandler(FileSystemEventHandler if Observer else object):
             # 每处理一个文件就保存一次日志（保证实时性）
             self.excel_logger.save()
 
-            if (
-                success
-                and status == "成功"
-                and invoice_no
-                and self.tax_processor
-                and self.auto_rename
-                and not (self.stop_event and self.stop_event.is_set())
-            ):
-                record = self.tax_processor.process_invoice(
-                    invoice_no,
-                    os.path.dirname(dest_path),
-                    prompt_callback=self.declaration_prompt_callback,
-                    allow_rename=self.auto_rename,
-                )
-                if record:
-                    self.log_callback(
-                        f"📋 退税材料判断: {invoice_no} | {record.get('状态', '')} | "
-                        f"缺少: {record.get('缺少材料') or '无'}"
-                    )
-                    if self.ledger_sync_manager:
-                        try:
-                            self.ledger_sync_manager.enqueue(invoice_no, record)
-                        except Exception as sync_exc:
-                            self.log_callback(f"⚠ 公司主台账状态同步失败: {invoice_no} | {sync_exc}")
         except Exception as e:
             msg = f"异常: {filepath} | {e}"
             self.log_callback(f"❌ {msg}")
@@ -4006,6 +3999,7 @@ class App(tk.Tk):
         self.pending_set: set = set()
         self._log_queue: queue.Queue = queue.Queue()
         self._finance_batch_running = False
+        self._tax_check_running = False
 
         self._build_ui()
         self._poll_log_queue()
@@ -4022,7 +4016,7 @@ class App(tk.Tk):
         ).pack()
         tk.Label(
             title_frame,
-            text="实时监视文件夹 · 按发票号归类 · 判断退税材料 · 自动改名",
+            text="实时监视文件夹 · 按发票号归类 · 手动检查退税材料 · 可生成标准命名副本",
             font=("微软雅黑", 10), fg="#D6EAF8", bg="#2E86AB"
         ).pack()
 
@@ -4064,7 +4058,7 @@ class App(tk.Tk):
 
         tk.Checkbutton(
             safety_frame,
-            text="生成标准命名副本",
+            text="检查时生成标准命名副本",
             variable=self.auto_rename_var,
             font=("微软雅黑", 10),
             bg="#F0F4F8",
@@ -4076,8 +4070,14 @@ class App(tk.Tk):
         btn_frame = tk.Frame(content, bg="#F0F4F8")
         btn_frame.pack(fill="x", pady=(0, 10))
 
+        primary_btn_frame = tk.Frame(btn_frame, bg="#F0F4F8")
+        primary_btn_frame.pack(fill="x", pady=(0, 6))
+
+        secondary_btn_frame = tk.Frame(btn_frame, bg="#F0F4F8")
+        secondary_btn_frame.pack(fill="x")
+
         self.btn_start = tk.Button(
-            btn_frame, text="▶  开始监控", font=("微软雅黑", 12, "bold"),
+            primary_btn_frame, text="▶  开始监控", font=("微软雅黑", 12, "bold"),
             bg="#27AE60", fg="white", activebackground="#1E8449",
             relief="flat", padx=20, pady=8, cursor="hand2",
             command=self._start
@@ -4085,15 +4085,23 @@ class App(tk.Tk):
         self.btn_start.pack(side="left", padx=(0, 10))
 
         self.btn_stop = tk.Button(
-            btn_frame, text="⏹  停止监控", font=("微软雅黑", 12, "bold"),
+            primary_btn_frame, text="⏹  停止监控", font=("微软雅黑", 12, "bold"),
             bg="#E74C3C", fg="white", activebackground="#C0392B",
             relief="flat", padx=20, pady=8, cursor="hand2",
             state="disabled", command=self._stop
         )
         self.btn_stop.pack(side="left", padx=(0, 10))
 
+        self.btn_tax_check = tk.Button(
+            primary_btn_frame, text="🔍  检查退税材料", font=("微软雅黑", 12, "bold"),
+            bg="#2874A6", fg="white", activebackground="#1F618D",
+            relief="flat", padx=18, pady=8, cursor="hand2",
+            command=self._check_tax_materials
+        )
+        self.btn_tax_check.pack(side="left", padx=(0, 10))
+
         self.btn_finance_batch = tk.Button(
-            btn_frame, text="📦  生成财务批次包", font=("微软雅黑", 11, "bold"),
+            secondary_btn_frame, text="📦  生成财务批次包", font=("微软雅黑", 11, "bold"),
             bg="#8E44AD", fg="white", activebackground="#6C3483",
             relief="flat", padx=14, pady=8, cursor="hand2",
             command=self._generate_finance_batch
@@ -4101,7 +4109,7 @@ class App(tk.Tk):
         self.btn_finance_batch.pack(side="left", padx=(0, 10))
 
         self.btn_undo = tk.Button(
-            btn_frame, text="↩  撤销上次整理", font=("微软雅黑", 11, "bold"),
+            secondary_btn_frame, text="↩  撤销上次整理", font=("微软雅黑", 11, "bold"),
             bg="#D35400", fg="white", activebackground="#A04000",
             relief="flat", padx=14, pady=8, cursor="hand2",
             command=self._undo_last_operations
@@ -4109,7 +4117,7 @@ class App(tk.Tk):
         self.btn_undo.pack(side="left", padx=(0, 10))
 
         self.btn_clear = tk.Button(
-            btn_frame, text="🗑  清空日志", font=("微软雅黑", 11),
+            secondary_btn_frame, text="🗑  清空日志", font=("微软雅黑", 11),
             bg="#95A5A6", fg="white", activebackground="#7F8C8D",
             relief="flat", padx=14, pady=8, cursor="hand2",
             command=self._clear_log
@@ -4119,7 +4127,7 @@ class App(tk.Tk):
         # 状态栏
         self.status_var = tk.StringVar(value="⚫ 未启动")
         status_bar = tk.Label(
-            btn_frame, textvariable=self.status_var,
+            primary_btn_frame, textvariable=self.status_var,
             font=("微软雅黑", 11), bg="#F0F4F8", fg="#7F8C8D"
         )
         status_bar.pack(side="right", padx=10)
@@ -4150,7 +4158,7 @@ class App(tk.Tk):
 
         # 底部提示
         tip = tk.Label(
-            self, text="💡 默认预览模式不会改动文件；确认计划无误后取消勾选再执行。所有真实复制都会写入操作清单，可用【撤销上次整理】回退。",
+            self, text="💡 默认预览模式不会改动文件；先监控整理，停止后点【检查退税材料】做整票 OCR。真实复制会写入操作清单，可用【撤销上次整理】回退。",
             font=("微软雅黑", 9), bg="#D5E8D4", fg="#27AE60", pady=4
         )
         tip.pack(fill="x", side="bottom")
@@ -4237,27 +4245,102 @@ class App(tk.Tk):
     def _confirm_real_run(self, candidate_count: int) -> bool:
         if self.dry_run_var.get():
             return True
-        auto_rename_text = (
-            "\n已启用【生成标准命名副本】，不会移动原文件夹，但会复制生成新文件夹。"
-            if self.auto_rename_var.get()
-            else ""
-        )
         if candidate_count > SAFE_BATCH_CONFIRM_LIMIT:
             value = simpledialog.askstring(
                 "二次确认",
                 f"当前将真实复制 {candidate_count} 个已有文件，超过安全阈值 {SAFE_BATCH_CONFIRM_LIMIT}。"
-                f"{auto_rename_text}\n\n如确认执行，请输入：确认执行",
+                "\n\n如确认执行，请输入：确认执行",
                 parent=self,
             )
             return (value or "").strip() == "确认执行"
         return messagebox.askyesno(
             "确认执行",
             f"当前不是预览模式，将真实复制 {candidate_count} 个已有文件。"
-            f"{auto_rename_text}\n\n确认继续吗？",
+            "\n\n确认继续吗？",
         )
+
+    def _check_tax_materials(self):
+        if self._tax_check_running:
+            return
+        if self._finance_batch_running:
+            messagebox.showwarning("提示", "财务批次包正在生成，请完成后再检查退税材料。")
+            return
+        if openpyxl is None:
+            messagebox.showerror("缺少依赖", "请先安装 openpyxl：\npip install openpyxl")
+            return
+        if self.is_running or self._is_stopping:
+            messagebox.showwarning("提示", "请先停止监控，再检查退税材料。")
+            return
+
+        output = self.output_dir.get().strip()
+        if not output or not os.path.isdir(output):
+            messagebox.showwarning("提示", "请先选择有效的输出主文件夹！")
+            return
+        output = normalize_path(output)
+
+        dry_run = self.dry_run_var.get()
+        allow_rename = self.auto_rename_var.get()
+        if allow_rename and not dry_run:
+            if not messagebox.askyesno(
+                "确认生成标准命名副本",
+                "将对输出目录中已归类的发票文件夹做退税材料检查；"
+                "符合条件的发票会复制生成标准命名副本，原文件夹保留。\n\n确认继续吗？",
+            ):
+                return
+
+        self._tax_check_running = True
+        self.btn_tax_check.config(state="disabled")
+        self.btn_start.config(state="disabled")
+        self.btn_finance_batch.config(state="disabled")
+        self._enqueue_log("🔍 开始检查退税材料（整票 OCR 判断）")
+
+        def worker():
+            try:
+                settings = ensure_app_settings(APP_SETTINGS_PATH)
+                invoice_workbook = find_invoice_workbook(settings)
+                if not invoice_workbook:
+                    raise RuntimeError(
+                        "未找到公司系统出运统计发票号清单，请把主台账放到："
+                        f"{DEFAULT_COMPANY_LEDGER}"
+                    )
+                invoice_records = load_invoice_records(str(invoice_workbook))
+                invoice_numbers = sorted(invoice_records.keys(), key=len, reverse=True)
+                if not invoice_numbers:
+                    raise RuntimeError(f"公司系统主台账没有可用发票号：{invoice_workbook}")
+
+                operation_manifest = None
+                if allow_rename:
+                    run_id = f"tax_check_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    operation_manifest = OperationManifest(output, dry_run=dry_run, run_id=run_id)
+                    self._enqueue_log(f"🧾 检查操作清单: {operation_manifest.path}")
+                    if dry_run:
+                        self._enqueue_log("🧾 当前为预览模式：只生成标准命名副本计划")
+
+                tax_processor = TaxRefundProcessor(
+                    output,
+                    ledger_records=invoice_records,
+                    dry_run=dry_run,
+                    operation_manifest=operation_manifest,
+                )
+                summary = tax_processor.process_all_invoice_folders(
+                    invoice_numbers,
+                    prompt_callback=self._request_declaration_no,
+                    log_callback=self._enqueue_log,
+                    allow_rename=allow_rename,
+                )
+                summary["report_dir"] = output
+                summary["operation_manifest"] = operation_manifest.path if operation_manifest else ""
+                self._log_queue.put(("tax_check_done", summary))
+            except Exception as exc:
+                self._log_queue.put(("tax_check_error", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _generate_finance_batch(self):
         if self._finance_batch_running:
+            return
+        if self._tax_check_running:
+            messagebox.showwarning("提示", "退税材料检查正在运行，请完成后再生成财务批次包。")
             return
         if openpyxl is None:
             messagebox.showerror("缺少依赖", "请先安装 openpyxl：\npip install openpyxl")
@@ -4370,7 +4453,6 @@ class App(tk.Tk):
             return
 
         dry_run = self.dry_run_var.get()
-        auto_rename = self.auto_rename_var.get()
         run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.operation_manifest = OperationManifest(output, dry_run=dry_run, run_id=run_id)
 
@@ -4428,7 +4510,7 @@ class App(tk.Tk):
             stop_event=self.stop_event,
             dry_run=dry_run,
             operation_manifest=self.operation_manifest,
-            auto_rename=auto_rename,
+            auto_rename=False,
         )
 
         self.observer = Observer()
@@ -4446,18 +4528,12 @@ class App(tk.Tk):
         self._enqueue_log(f"📒 发票号清单: {invoice_workbook}（{len(invoice_numbers)} 个发票号）")
         self._enqueue_log(f"📋 退税材料规则: {DEFAULT_MATERIAL_CONFIG}")
         self._enqueue_log(f"🔁 已启用递归监听；启动时已提交 {submitted_count} 个已有文件")
+        self._enqueue_log("🔍 整票 OCR 判断已独立：停止监控后点击【检查退税材料】")
         self._enqueue_log("─" * 60)
-
-        self.executor.submit(
-            self.tax_processor.process_all_invoice_folders,
-            invoice_numbers,
-            self._request_declaration_no,
-            self._enqueue_log,
-            auto_rename,
-        )
 
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
+        self.btn_tax_check.config(state="disabled")
         self.status_var.set("🟢 监控中…")
 
     def _scan_existing_files(self, watch: str, handler: FileHandler) -> int:
@@ -4536,6 +4612,7 @@ class App(tk.Tk):
         self._write_log_line(f"⏹ 已停止监控。本次共处理 {self._processed_count} 个文件。")
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
+        self.btn_tax_check.config(state="normal")
         self.btn_undo.config(state="normal")
         self.status_var.set("⚫ 已停止")
 
@@ -4582,6 +4659,38 @@ class App(tk.Tk):
         self._write_log_line(f"❌ 财务批次处理失败: {error}")
         messagebox.showerror("财务批次处理失败", error)
 
+    def _finish_tax_check(self, summary: dict):
+        self._tax_check_running = False
+        self.btn_tax_check.config(state="normal")
+        self.btn_start.config(state="normal")
+        self.btn_finance_batch.config(state="normal")
+        counts = summary.get("counts", {})
+        self._write_log_line(
+            "🔍 退税材料检查完成："
+            f"已检查 {summary.get('total', 0)} 个发票文件夹；"
+            f"齐了 {counts.get('齐了', 0)}，缺材料 {counts.get('缺材料', 0)}，"
+            f"待复核 {counts.get('待复核', 0)}，不通过 {counts.get('不通过', 0)}"
+        )
+        if summary.get("operation_manifest"):
+            self._write_log_line(f"🧾 检查操作清单: {summary.get('operation_manifest')}")
+        messagebox.showinfo(
+            "退税材料检查完成",
+            f"已检查发票文件夹：{summary.get('total', 0)} 个\n"
+            f"齐了：{counts.get('齐了', 0)}\n"
+            f"缺材料：{counts.get('缺材料', 0)}\n"
+            f"待复核：{counts.get('待复核', 0)}\n"
+            f"不通过：{counts.get('不通过', 0)}\n"
+            f"判断报告目录：\n{summary.get('report_dir', '')}",
+        )
+
+    def _finish_tax_check_error(self, error: str):
+        self._tax_check_running = False
+        self.btn_tax_check.config(state="normal")
+        self.btn_start.config(state="normal")
+        self.btn_finance_batch.config(state="normal")
+        self._write_log_line(f"❌ 退税材料检查失败: {error}")
+        messagebox.showerror("退税材料检查失败", error)
+
     def _write_log_line(self, msg: str):
         self.log_text.config(state="normal")
         self.log_text.insert("end", msg + "\n")
@@ -4601,6 +4710,12 @@ class App(tk.Tk):
                     continue
                 if isinstance(item, tuple) and item and item[0] == "finance_batch_error":
                     self._finish_finance_batch_error(item[1])
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "tax_check_done":
+                    self._finish_tax_check(item[1])
+                    continue
+                if isinstance(item, tuple) and item and item[0] == "tax_check_error":
+                    self._finish_tax_check_error(item[1])
                     continue
                 if isinstance(item, tuple) and item and item[0] == "undo_done":
                     summary = item[1]
