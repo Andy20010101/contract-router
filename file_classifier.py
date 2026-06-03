@@ -2148,7 +2148,7 @@ class MaterialClassifier:
         stripped_name = strip_invoice_prefix(filename, invoice_no)
         best = None
         for material in self.materials:
-            score, reasons = self._score_file_name(material, stripped_name)
+            score, reasons = self._score_file_name(material, stripped_name, filename, invoice_no)
             if best is None or score > best["score"]:
                 best = {
                     "material": material,
@@ -2158,6 +2158,7 @@ class MaterialClassifier:
 
         if best and best["score"] >= self.manual_score:
             material = best["material"]
+            trusted_filename = self._has_trusted_invoice_filename(best["reasons"])
             return {
                 "filename": filename,
                 "path": filepath,
@@ -2167,7 +2168,7 @@ class MaterialClassifier:
                 "material_name": material["name"],
                 "required": bool(material.get("required")),
                 "score": best["score"],
-                "status": "matched" if material.get("file_name_only") else "manual_review",
+                "status": "matched" if material.get("file_name_only") or trusted_filename else "manual_review",
                 "reasons": best["reasons"],
                 "text": "",
                 "normalized_text": "",
@@ -2181,7 +2182,7 @@ class MaterialClassifier:
         for material in self.materials:
             if not material.get("file_name_only"):
                 continue
-            score, reasons = self._score_file_name(material, stripped_name)
+            score, reasons = self._score_file_name(material, stripped_name, filename, invoice_no)
             if score >= self.manual_score:
                 return {
                     "filename": filename,
@@ -2203,7 +2204,7 @@ class MaterialClassifier:
         all_scores = []
 
         for material in self.materials:
-            score, reasons = self._score_material(material, filepath, stripped_name, text_cache)
+            score, reasons = self._score_material(material, filepath, stripped_name, text_cache, filename, invoice_no)
             if score:
                 all_scores.append({
                     "material_id": material["id"],
@@ -2230,9 +2231,10 @@ class MaterialClassifier:
                 reason.startswith(("PDF", "OCR"))
                 for reason in best["reasons"]
             )
+            trusted_filename = self._has_trusted_invoice_filename(best["reasons"])
             if best["material"].get("file_name_only"):
                 status = "matched" if best["score"] >= self.manual_score else "unrecognized"
-            elif tied or best["score"] < self.auto_score or not has_content_match:
+            elif tied or best["score"] < self.auto_score or not (has_content_match or trusted_filename):
                 status = "manual_review"
             else:
                 status = "matched"
@@ -2259,8 +2261,16 @@ class MaterialClassifier:
             "normalized_text": normalize_document_text(text),
         }
 
-    def _score_material(self, material: dict, filepath: str, stripped_name: str, text_cache: dict) -> tuple[int, list[str]]:
-        score, reasons = self._score_file_name(material, stripped_name)
+    def _score_material(
+        self,
+        material: dict,
+        filepath: str,
+        stripped_name: str,
+        text_cache: dict,
+        filename: str,
+        invoice_no: str,
+    ) -> tuple[int, list[str]]:
+        score, reasons = self._score_file_name(material, stripped_name, filename, invoice_no)
 
         if material.get("file_name_only"):
             return score, reasons
@@ -2335,7 +2345,12 @@ class MaterialClassifier:
         return 0, []
 
     @staticmethod
-    def _score_file_name(material: dict, stripped_name: str) -> tuple[int, list[str]]:
+    def _score_file_name(
+        material: dict,
+        stripped_name: str,
+        filename: str = "",
+        invoice_no: str = "",
+    ) -> tuple[int, list[str]]:
         score = 0
         reasons = []
         for pattern in material.get("file_name_patterns", []):
@@ -2347,7 +2362,45 @@ class MaterialClassifier:
         if final_name and keyword_match(final_name, stripped_name):
             score += 20 if material.get("file_name_only") else 15
             reasons.append(f"文件名标准名命中:{final_name}")
+        trusted_label = MaterialClassifier._invoice_prefixed_standard_name_match(material, filename, invoice_no)
+        if trusted_label:
+            score += 30
+            reasons.append(f"当前发票号文件名命中:{trusted_label}")
         return score, reasons
+
+    @staticmethod
+    def _has_trusted_invoice_filename(reasons: list[str]) -> bool:
+        return any(reason.startswith("当前发票号文件名命中:") for reason in reasons)
+
+    @staticmethod
+    def _invoice_prefixed_standard_name_match(material: dict, filename: str, invoice_no: str) -> str:
+        if not filename or not invoice_no or material.get("id") == "purchase_contract":
+            return ""
+        final_name = material.get("final_name") or material.get("name") or ""
+        if not final_name:
+            return ""
+
+        stem = normalize_unicode_text(Path(filename).stem).strip()
+        if not stem:
+            return ""
+
+        prefixes = []
+        full_invoice = normalize_unicode_text(str(invoice_no)).strip()
+        if full_invoice:
+            prefixes.append(("发票号", full_invoice))
+        digits = invoice_digits(invoice_no)
+        if digits and len(digits) >= 6 and digits != full_invoice:
+            prefixes.append(("纯数字发票号", digits))
+
+        expected_name = normalize_text_for_match(final_name)
+        for label, prefix in prefixes:
+            if not re.match(re.escape(prefix) + r"(?![A-Za-z0-9])", stem, re.IGNORECASE):
+                continue
+            remainder = stem[len(prefix):]
+            remainder = re.sub(r"^[\s_\-—–+]+", "", remainder)
+            if normalize_text_for_match(remainder) == expected_name:
+                return f"{label}+{final_name}"
+        return ""
 
     @staticmethod
     def _score_text_rules(rules: dict, text: str, source: str) -> tuple[int, list[str]]:

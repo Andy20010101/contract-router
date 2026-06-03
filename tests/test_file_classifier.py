@@ -245,6 +245,82 @@ def test_routing_classifier_uses_filename_without_ocr(monkeypatch, tmp_path):
     assert result["material_id"] == "export_sales"
 
 
+@pytest.mark.parametrize(
+    ("filename", "material_id"),
+    [
+        ("25112112外销.jpg", "export_sales"),
+        ("25112112报关委托书.jpg", "customs_power_of_attorney"),
+        ("25112112报关费发票.jpg", "customs_fee_invoice"),
+        ("25112112提单.jpg", "bill_of_lading"),
+        ("25112112装箱单.jpg", "packing_list"),
+        ("25112112运费发票.jpg", "freight_invoice"),
+    ],
+)
+def test_invoice_digit_prefixed_standard_material_name_auto_matches_without_ocr(
+    monkeypatch, tmp_path, filename, material_id
+):
+    document = tmp_path / filename
+    document.write_bytes(b"image")
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: "")
+
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+    result = classifier.classify_file(str(document), "LY25112112")
+
+    assert result["status"] == "matched"
+    assert result["material_id"] == material_id
+    assert result["score"] >= 70
+    assert any(reason.startswith("当前发票号文件名命中:") for reason in result["reasons"])
+
+
+def test_invoice_prefixed_packing_list_routes_as_matched_without_ocr(monkeypatch, tmp_path):
+    document = tmp_path / "LY25112112装箱单.jpg"
+    document.write_bytes(b"image")
+
+    def fail_text_read(*args, **kwargs):
+        raise AssertionError("routing classification should not OCR trusted filenames")
+
+    monkeypatch.setattr(fc, "pdf_text", fail_text_read)
+    monkeypatch.setattr(fc, "ocr_text", fail_text_read)
+
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+    result = classifier.classify_file_for_routing(str(document), "LY25112112")
+
+    assert result["status"] == "matched"
+    assert result["material_id"] == "packing_list"
+    assert result["score"] >= 70
+
+
+def test_invoice_prefixed_material_name_requires_current_invoice_and_exact_name(monkeypatch, tmp_path):
+    monkeypatch.setattr(fc, "ocr_text", lambda filepath, max_pdf_pages=1: "")
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+
+    wrong_invoice = tmp_path / "25112113装箱单.jpg"
+    wrong_invoice.write_bytes(b"image")
+    result = classifier.classify_file(str(wrong_invoice), "LY25112112")
+    assert result["status"] == "manual_review"
+    assert result["material_id"] == "packing_list"
+    assert not any(reason.startswith("当前发票号文件名命中:") for reason in result["reasons"])
+
+    extra_text = tmp_path / "25112112装箱单补充.jpg"
+    extra_text.write_bytes(b"image")
+    result = classifier.classify_file(str(extra_text), "LY25112112")
+    assert result["status"] == "manual_review"
+    assert result["material_id"] == "packing_list"
+    assert not any(reason.startswith("当前发票号文件名命中:") for reason in result["reasons"])
+
+
+def test_purchase_contract_is_excluded_from_invoice_prefixed_filename_boost(tmp_path):
+    document = tmp_path / "25112112采购合同.jpg"
+    document.write_bytes(b"image")
+
+    classifier = fc.MaterialClassifier(fc.default_material_config())
+    result = classifier.classify_file(str(document), "LY25112112")
+
+    assert result["status"] == "matched"
+    assert result["material_id"] == "purchase_contract"
+    assert not any(reason.startswith("当前发票号文件名命中:") for reason in result["reasons"])
+
+
 def test_image_ocr_uses_preprocessed_variants(monkeypatch, tmp_path):
     image = tmp_path / "装箱单.jpg"
     image.write_bytes(b"image")
